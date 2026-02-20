@@ -1,4 +1,6 @@
 import "dotenv/config";
+import path from "node:path";
+import fs from "node:fs";
 import { createClient as createLibsqlClient, type Client as LibsqlClient } from "@libsql/client";
 import {
   ChannelType,
@@ -14,6 +16,43 @@ import {
   type Interaction,
   type Message
 } from "discord.js";
+import { createLsHubServices as createLocalLsHubServices } from "./lsHubServicesFallback";
+
+function loadSharedServicesFactory(): {
+  createLsHubServices: (options: { db?: LibsqlClient; tursoUrl?: string; tursoToken?: string }) => {
+    queryKnowledgeContext: (
+      query: string,
+      options?: { limit?: number; openAiApiKey?: string }
+    ) => Promise<{ method: string; text: string }>;
+  };
+} {
+  const candidates = [
+    "latent-space-hub-mcp/services",
+    "./lsHubServicesFallback",
+    process.env.LSH_MCP_SERVICES_PATH?.trim() || "",
+    path.resolve(__dirname, "../../latent-space-hub/apps/mcp-server-standalone/services")
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      return require(candidate);
+    } catch {
+      // try next candidate
+    }
+  }
+
+  return {
+    createLsHubServices: (options) => {
+      if (!options.db) {
+        throw new Error("Local LS services fallback requires a db client.");
+      }
+      return createLocalLsHubServices({ db: options.db });
+    }
+  };
+}
+
+const { createLsHubServices } = loadSharedServicesFactory();
 
 type BotProfile = {
   name: "Sig" | "Slop";
@@ -23,13 +62,20 @@ type BotProfile = {
   appId?: string;
 };
 
+type BotProfileSeed = {
+  name: "Sig" | "Slop";
+  token: string;
+  model: string;
+  soulFile: string;
+  appId?: string;
+};
+
 type DestinationChannel = {
   sendTyping: () => Promise<void>;
   send: (content: string) => Promise<unknown>;
 };
 
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
-const OPENAI_EMBEDDINGS_URL = "https://api.openai.com/v1/embeddings";
 const MAX_CONTEXT_ROWS = 6;
 const processedMessageIds = new Set<string>();
 const rateLimitByUser = new Map<string, number>();
@@ -67,27 +113,48 @@ const db = createLibsqlClient({
   url: TURSO_DATABASE_URL,
   authToken: TURSO_AUTH_TOKEN
 });
+const lsHubServices = createLsHubServices({ db });
 
-const profiles: BotProfile[] = [
+const profileSeeds: BotProfileSeed[] = [
   {
     name: "Sig",
     token: requiredEnv("BOT_TOKEN_SIG"),
     model: SIG_MODEL,
     appId: process.env.BOT_APP_ID_SIG,
-    systemPrompt:
-      "You are Sig: precise, factual, concise. Always ground claims in provided context. " +
-      "If unsure, say what is missing. Prefer direct, useful answers and cite sources."
+    soulFile: "sig.soul.md"
   },
   {
     name: "Slop",
     token: requiredEnv("BOT_TOKEN_SLOP"),
     model: SLOP_MODEL,
     appId: process.env.BOT_APP_ID_SLOP,
-    systemPrompt:
-      "You are Slop: opinionated and provocative, but still grounded in provided context. " +
-      "Be energetic and concise. Never fabricate facts; call out uncertainty."
+    soulFile: "slop.soul.md"
   }
 ];
+
+function readSoulDocument(filename: string): string {
+  const soulPath = path.join(process.cwd(), "personas", filename);
+  if (!fs.existsSync(soulPath)) {
+    throw new Error(`Missing SOUL file: ${soulPath}`);
+  }
+  const text = fs.readFileSync(soulPath, "utf8").trim();
+  if (!text) {
+    throw new Error(`SOUL file is empty: ${soulPath}`);
+  }
+  return text;
+}
+
+function buildProfiles(): BotProfile[] {
+  return profileSeeds.map((seed) => ({
+    name: seed.name,
+    token: seed.token,
+    model: seed.model,
+    appId: seed.appId,
+    systemPrompt: readSoulDocument(seed.soulFile)
+  }));
+}
+
+const profiles = buildProfiles();
 
 function cleanUserPrompt(message: Message, botUserId: string): string {
   const mentionPattern = new RegExp(`<@!?${botUserId}>`, "g");
@@ -135,199 +202,15 @@ function withinRateLimit(message: Message): boolean {
   return true;
 }
 
-async function getQueryEmbedding(query: string): Promise<number[] | null> {
-  if (!OPENAI_API_KEY) return null;
-
-  try {
-    const response = await fetch(OPENAI_EMBEDDINGS_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: "text-embedding-3-small",
-        input: query
-      })
-    });
-
-    if (!response.ok) {
-      return null;
-    }
-
-    const json = (await response.json()) as {
-      data?: Array<{ embedding?: number[] }>;
-    };
-    const embedding = json.data?.[0]?.embedding;
-    return Array.isArray(embedding) ? embedding : null;
-  } catch {
-    return null;
-  }
-}
-
-function vectorToJsonString(vector: number[]): string {
-  return `[${vector.join(",")}]`;
-}
-
-type KnowledgeHit = {
-  source: "vector" | "fts" | "nodes";
-  score: number;
-  nodeId: number;
-  title: string;
-  description: string;
-  excerpt: string;
-  link: string;
-  eventDate: string;
-};
-
-async function vectorSearch(queryEmbedding: number[], limit: number): Promise<KnowledgeHit[]> {
-  const vecJson = vectorToJsonString(queryEmbedding);
-  const result = await db.execute({
-    sql:
-      "SELECT n.id AS node_id, n.title, coalesce(n.description, '') AS description, " +
-      "substr(c.text, 1, 700) AS excerpt, coalesce(n.link, '') AS link, coalesce(n.event_date, '') AS event_date, " +
-      "(1.0 - vector_distance_cos(c.embedding, vector(?))) AS score " +
-      "FROM vector_top_k('chunks_embedding_idx', vector(?), ?) AS vt " +
-      "JOIN chunks c ON c.rowid = vt.id " +
-      "JOIN nodes n ON n.id = c.node_id " +
-      "ORDER BY score DESC",
-    args: [vecJson, vecJson, limit]
+async function queryKnowledgeBase(query: string, limit = MAX_CONTEXT_ROWS): Promise<{ method: string; text: string }> {
+  const result = await lsHubServices.queryKnowledgeContext(query, {
+    limit,
+    openAiApiKey: OPENAI_API_KEY || undefined
   });
-
-  return result.rows.map((row) => ({
-    source: "vector",
-    score: Number(row.score || 0),
-    nodeId: Number(row.node_id),
-    title: String(row.title || "Untitled"),
-    description: String(row.description || ""),
-    excerpt: String(row.excerpt || ""),
-    link: String(row.link || ""),
-    eventDate: String(row.event_date || "")
-  }));
-}
-
-async function ftsSearch(query: string, limit: number): Promise<KnowledgeHit[]> {
-  const terms = query
-    .trim()
-    .split(/\s+/)
-    .filter((t) => t.length > 1)
-    .map((t) => `"${t.replace(/"/g, "")}"`)
-    .join(" ");
-
-  if (!terms) return [];
-
-  const result = await db.execute({
-    sql:
-      "SELECT n.id AS node_id, n.title, coalesce(n.description, '') AS description, " +
-      "substr(c.text, 1, 700) AS excerpt, coalesce(n.link, '') AS link, coalesce(n.event_date, '') AS event_date, " +
-      "bm25(chunks_fts) AS rank_score " +
-      "FROM chunks_fts " +
-      "JOIN chunks c ON c.rowid = chunks_fts.rowid " +
-      "JOIN nodes n ON n.id = c.node_id " +
-      "WHERE chunks_fts MATCH ? " +
-      "ORDER BY rank_score ASC " +
-      "LIMIT ?",
-    args: [terms, limit]
-  });
-
-  const rows = result.rows.map((row) => Number(row.rank_score ?? 0));
-  const maxAbs = Math.max(...rows.map((v) => Math.abs(v)), 1);
-
-  return result.rows.map((row) => ({
-    source: "fts",
-    score: Math.abs(Number(row.rank_score || 0)) / maxAbs,
-    nodeId: Number(row.node_id),
-    title: String(row.title || "Untitled"),
-    description: String(row.description || ""),
-    excerpt: String(row.excerpt || ""),
-    link: String(row.link || ""),
-    eventDate: String(row.event_date || "")
-  }));
-}
-
-async function nodeTextFallback(query: string, limit: number): Promise<KnowledgeHit[]> {
-  const like = `%${query.toLowerCase()}%`;
-  const result = await db.execute({
-    sql:
-      "SELECT id AS node_id, title, coalesce(description, '') AS description, " +
-      "substr(coalesce(notes, ''), 1, 700) AS excerpt, coalesce(link, '') AS link, coalesce(event_date, '') AS event_date " +
-      "FROM nodes " +
-      "WHERE lower(title) LIKE ? OR lower(coalesce(description, '')) LIKE ? " +
-      "OR lower(coalesce(notes, '')) LIKE ? OR lower(coalesce(chunk, '')) LIKE ? " +
-      "ORDER BY event_date DESC NULLS LAST, updated_at DESC " +
-      "LIMIT ?",
-    args: [like, like, like, like, limit]
-  });
-
-  return result.rows.map((row) => ({
-    source: "nodes",
-    score: 0.4,
-    nodeId: Number(row.node_id),
-    title: String(row.title || "Untitled"),
-    description: String(row.description || ""),
-    excerpt: String(row.excerpt || ""),
-    link: String(row.link || ""),
-    eventDate: String(row.event_date || "")
-  }));
-}
-
-function fuseHybrid(vectorHits: KnowledgeHit[], ftsHits: KnowledgeHit[], maxResults: number): KnowledgeHit[] {
-  const k = 60;
-  const map = new Map<number, { score: number; hit: KnowledgeHit }>();
-
-  vectorHits.forEach((hit, idx) => {
-    map.set(hit.nodeId, { score: 1 / (k + idx + 1), hit });
-  });
-
-  ftsHits.forEach((hit, idx) => {
-    const rrf = 1 / (k + idx + 1);
-    const existing = map.get(hit.nodeId);
-    if (existing) {
-      existing.score += rrf;
-      if (existing.hit.excerpt.length < hit.excerpt.length) {
-        existing.hit = hit;
-      }
-    } else {
-      map.set(hit.nodeId, { score: rrf, hit });
-    }
-  });
-
-  return [...map.values()]
-    .sort((a, b) => b.score - a.score)
-    .slice(0, maxResults)
-    .map((entry) => ({
-      ...entry.hit,
-      score: entry.score
-    }));
-}
-
-async function queryKnowledgeBase(client: LibsqlClient, query: string, limit = MAX_CONTEXT_ROWS): Promise<string> {
-  const embedding = await getQueryEmbedding(query);
-  const vectorHits = embedding ? await vectorSearch(embedding, limit * 2).catch(() => []) : [];
-  const ftsHits = await ftsSearch(query, limit * 2).catch(() => []);
-
-  let hits = fuseHybrid(vectorHits, ftsHits, limit);
-  let method = embedding ? "hybrid" : "fts";
-
-  if (!hits.length) {
-    hits = await nodeTextFallback(query, limit).catch(() => []);
-    method = "nodes_fallback";
-  }
-
-  if (!hits.length) {
-    return "No matching rows found in nodes/chunks tables.";
-  }
-
-  const lines = hits.map((hit, idx) => {
-    return (
-      `${idx + 1}. [${hit.eventDate || "unknown-date"}] ${hit.title}\n` +
-      `Desc: ${hit.description}\n` +
-      `Excerpt: ${hit.excerpt}\n` +
-      `Link: ${hit.link}`
-    );
-  });
-
-  return `Search method: ${method}\n\n${lines.join("\n\n")}`;
+  return {
+    method: result.method || "unknown",
+    text: result.text || "No matching rows found in nodes/chunks tables."
+  };
 }
 
 async function ensureDestinationChannel(message: Message, botName: string): Promise<DestinationChannel> {
@@ -452,8 +335,9 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   const destination = await ensureDestinationChannel(message, profile.name);
   await destination.sendTyping();
 
-  const context = await queryKnowledgeBase(db, prompt);
-  const contextMethodLine = context.split("\n", 1)[0] || "Search method: unknown";
+  const contextResult = await queryKnowledgeBase(prompt);
+  const context = contextResult.text;
+  const contextMethodLine = `Search method: ${contextResult.method}`;
 
   try {
     if (maybeCommand?.command === "debate" && profile.name === "Sig") {
@@ -515,7 +399,8 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
     return;
   }
 
-  const context = await queryKnowledgeBase(db, query);
+  const contextResult = await queryKnowledgeBase(query);
+  const context = contextResult.text;
 
   if (command === "search") {
     const snippets = context.length > 1800 ? `${context.slice(0, 1800)}...` : context;
