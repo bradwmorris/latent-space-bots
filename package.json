@@ -12,7 +12,11 @@
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@libsql/client": "^0.17.0",
+    "discord.js": "^14.19.3",
+    "dotenv": "^17.2.3"
+  },
   "devDependencies": {
     "typescript": "^5.7.3",
     "tsx": "^4.20.3",

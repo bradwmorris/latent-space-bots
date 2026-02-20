@@ -1,3 +1,41 @@
+import "dotenv/config";
+import { createClient as createLibsqlClient, type Client as LibsqlClient } from "@libsql/client";
+import {
+  ChannelType,
+  Client,
+  Events,
+  GatewayIntentBits,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  ThreadAutoArchiveDuration,
+  type ChatInputCommandInteraction,
+  type GuildTextBasedChannel,
+  type Interaction,
+  type Message
+} from "discord.js";
+
+type BotProfile = {
+  name: "Sig" | "Slop";
+  token: string;
+  model: string;
+  systemPrompt: string;
+  appId?: string;
+};
+
+type DestinationChannel = {
+  sendTyping: () => Promise<void>;
+  send: (content: string) => Promise<unknown>;
+};
+
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const OPENAI_EMBEDDINGS_URL = "https://api.openai.com/v1/embeddings";
+const MAX_CONTEXT_ROWS = 6;
+const processedMessageIds = new Set<string>();
+const rateLimitByUser = new Map<string, number>();
+const rateLimitByChannel = new Map<string, number>();
+const activeDebates = new Set<string>();
+
 function requiredEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
@@ -6,12 +44,581 @@ function requiredEnv(name: string): string {
   return value;
 }
 
-function main(): void {
-  requiredEnv("BOT_TOKEN_SIG");
-  requiredEnv("BOT_TOKEN_SLOP");
+const TURSO_DATABASE_URL = requiredEnv("TURSO_DATABASE_URL");
+const TURSO_AUTH_TOKEN = requiredEnv("TURSO_AUTH_TOKEN");
+const OPENROUTER_API_KEY = requiredEnv("OPENROUTER_API_KEY");
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
-  console.log("latent-space-bots bootstrap service started");
-  console.log("Sig and Slop runtime wiring will be added next.");
+const SIG_MODEL = process.env.SIG_MODEL || "anthropic/claude-sonnet-4";
+const SLOP_MODEL = process.env.SLOP_MODEL || "moonshotai/kimi-k2";
+const DISCORD_TEST_GUILD_ID = process.env.DISCORD_TEST_GUILD_ID || "";
+const ALLOWED_CHANNEL_IDS = new Set(
+  (process.env.ALLOWED_CHANNEL_IDS || "")
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean)
+);
+const USER_RATE_LIMIT_WINDOW_MS = Number(process.env.USER_RATE_LIMIT_WINDOW_MS || 5000);
+const CHANNEL_RATE_LIMIT_WINDOW_MS = Number(process.env.CHANNEL_RATE_LIMIT_WINDOW_MS || 1200);
+const MAX_DEBATE_EXCHANGES = Number(process.env.MAX_DEBATE_EXCHANGES || 4);
+const ENABLE_CHAT_LOG_WRITE = String(process.env.ENABLE_CHAT_LOG_WRITE || "false").toLowerCase() === "true";
+
+const db = createLibsqlClient({
+  url: TURSO_DATABASE_URL,
+  authToken: TURSO_AUTH_TOKEN
+});
+
+const profiles: BotProfile[] = [
+  {
+    name: "Sig",
+    token: requiredEnv("BOT_TOKEN_SIG"),
+    model: SIG_MODEL,
+    appId: process.env.BOT_APP_ID_SIG,
+    systemPrompt:
+      "You are Sig: precise, factual, concise. Always ground claims in provided context. " +
+      "If unsure, say what is missing. Prefer direct, useful answers and cite sources."
+  },
+  {
+    name: "Slop",
+    token: requiredEnv("BOT_TOKEN_SLOP"),
+    model: SLOP_MODEL,
+    appId: process.env.BOT_APP_ID_SLOP,
+    systemPrompt:
+      "You are Slop: opinionated and provocative, but still grounded in provided context. " +
+      "Be energetic and concise. Never fabricate facts; call out uncertainty."
+  }
+];
+
+function cleanUserPrompt(message: Message, botUserId: string): string {
+  const mentionPattern = new RegExp(`<@!?${botUserId}>`, "g");
+  const cleaned = message.content.replace(mentionPattern, "").trim();
+  return cleaned || "Give a concise update based on the most relevant Latent Space context.";
 }
 
-main();
+function shouldRespondToMessage(message: Message, botUserId: string): boolean {
+  if (!message.inGuild()) return false;
+  if (message.author.bot) return false;
+
+  const directlyMentioned = message.mentions.users.has(botUserId);
+  const replyToBot =
+    Boolean(message.reference?.messageId) && message.mentions.repliedUser?.id === botUserId;
+
+  return directlyMentioned || replyToBot;
+}
+
+function parseCommand(content: string): { command: "ask" | "search" | "episode" | "debate"; query: string } | null {
+  const trimmed = content.trim();
+  const regex = /^\/(ask|search|episode|debate)\s+([\s\S]+)$/i;
+  const match = trimmed.match(regex);
+  if (!match) return null;
+  return {
+    command: match[1].toLowerCase() as "ask" | "search" | "episode" | "debate",
+    query: match[2].trim()
+  };
+}
+
+function isAllowedChannel(message: Message): boolean {
+  if (!ALLOWED_CHANNEL_IDS.size) return true;
+  return ALLOWED_CHANNEL_IDS.has(message.channelId);
+}
+
+function withinRateLimit(message: Message): boolean {
+  const now = Date.now();
+  const userLast = rateLimitByUser.get(message.author.id) || 0;
+  const channelLast = rateLimitByChannel.get(message.channelId) || 0;
+
+  if (now - userLast < USER_RATE_LIMIT_WINDOW_MS) return false;
+  if (now - channelLast < CHANNEL_RATE_LIMIT_WINDOW_MS) return false;
+
+  rateLimitByUser.set(message.author.id, now);
+  rateLimitByChannel.set(message.channelId, now);
+  return true;
+}
+
+async function getQueryEmbedding(query: string): Promise<number[] | null> {
+  if (!OPENAI_API_KEY) return null;
+
+  try {
+    const response = await fetch(OPENAI_EMBEDDINGS_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "text-embedding-3-small",
+        input: query
+      })
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const json = (await response.json()) as {
+      data?: Array<{ embedding?: number[] }>;
+    };
+    const embedding = json.data?.[0]?.embedding;
+    return Array.isArray(embedding) ? embedding : null;
+  } catch {
+    return null;
+  }
+}
+
+function vectorToJsonString(vector: number[]): string {
+  return `[${vector.join(",")}]`;
+}
+
+type KnowledgeHit = {
+  source: "vector" | "fts" | "nodes";
+  score: number;
+  nodeId: number;
+  title: string;
+  description: string;
+  excerpt: string;
+  link: string;
+  eventDate: string;
+};
+
+async function vectorSearch(queryEmbedding: number[], limit: number): Promise<KnowledgeHit[]> {
+  const vecJson = vectorToJsonString(queryEmbedding);
+  const result = await db.execute({
+    sql:
+      "SELECT n.id AS node_id, n.title, coalesce(n.description, '') AS description, " +
+      "substr(c.text, 1, 700) AS excerpt, coalesce(n.link, '') AS link, coalesce(n.event_date, '') AS event_date, " +
+      "(1.0 - vector_distance_cos(c.embedding, vector(?))) AS score " +
+      "FROM vector_top_k('chunks_embedding_idx', vector(?), ?) AS vt " +
+      "JOIN chunks c ON c.rowid = vt.id " +
+      "JOIN nodes n ON n.id = c.node_id " +
+      "ORDER BY score DESC",
+    args: [vecJson, vecJson, limit]
+  });
+
+  return result.rows.map((row) => ({
+    source: "vector",
+    score: Number(row.score || 0),
+    nodeId: Number(row.node_id),
+    title: String(row.title || "Untitled"),
+    description: String(row.description || ""),
+    excerpt: String(row.excerpt || ""),
+    link: String(row.link || ""),
+    eventDate: String(row.event_date || "")
+  }));
+}
+
+async function ftsSearch(query: string, limit: number): Promise<KnowledgeHit[]> {
+  const terms = query
+    .trim()
+    .split(/\s+/)
+    .filter((t) => t.length > 1)
+    .map((t) => `"${t.replace(/"/g, "")}"`)
+    .join(" ");
+
+  if (!terms) return [];
+
+  const result = await db.execute({
+    sql:
+      "SELECT n.id AS node_id, n.title, coalesce(n.description, '') AS description, " +
+      "substr(c.text, 1, 700) AS excerpt, coalesce(n.link, '') AS link, coalesce(n.event_date, '') AS event_date, " +
+      "bm25(chunks_fts) AS rank_score " +
+      "FROM chunks_fts " +
+      "JOIN chunks c ON c.rowid = chunks_fts.rowid " +
+      "JOIN nodes n ON n.id = c.node_id " +
+      "WHERE chunks_fts MATCH ? " +
+      "ORDER BY rank_score ASC " +
+      "LIMIT ?",
+    args: [terms, limit]
+  });
+
+  const rows = result.rows.map((row) => Number(row.rank_score ?? 0));
+  const maxAbs = Math.max(...rows.map((v) => Math.abs(v)), 1);
+
+  return result.rows.map((row) => ({
+    source: "fts",
+    score: Math.abs(Number(row.rank_score || 0)) / maxAbs,
+    nodeId: Number(row.node_id),
+    title: String(row.title || "Untitled"),
+    description: String(row.description || ""),
+    excerpt: String(row.excerpt || ""),
+    link: String(row.link || ""),
+    eventDate: String(row.event_date || "")
+  }));
+}
+
+async function nodeTextFallback(query: string, limit: number): Promise<KnowledgeHit[]> {
+  const like = `%${query.toLowerCase()}%`;
+  const result = await db.execute({
+    sql:
+      "SELECT id AS node_id, title, coalesce(description, '') AS description, " +
+      "substr(coalesce(notes, ''), 1, 700) AS excerpt, coalesce(link, '') AS link, coalesce(event_date, '') AS event_date " +
+      "FROM nodes " +
+      "WHERE lower(title) LIKE ? OR lower(coalesce(description, '')) LIKE ? " +
+      "OR lower(coalesce(notes, '')) LIKE ? OR lower(coalesce(chunk, '')) LIKE ? " +
+      "ORDER BY event_date DESC NULLS LAST, updated_at DESC " +
+      "LIMIT ?",
+    args: [like, like, like, like, limit]
+  });
+
+  return result.rows.map((row) => ({
+    source: "nodes",
+    score: 0.4,
+    nodeId: Number(row.node_id),
+    title: String(row.title || "Untitled"),
+    description: String(row.description || ""),
+    excerpt: String(row.excerpt || ""),
+    link: String(row.link || ""),
+    eventDate: String(row.event_date || "")
+  }));
+}
+
+function fuseHybrid(vectorHits: KnowledgeHit[], ftsHits: KnowledgeHit[], maxResults: number): KnowledgeHit[] {
+  const k = 60;
+  const map = new Map<number, { score: number; hit: KnowledgeHit }>();
+
+  vectorHits.forEach((hit, idx) => {
+    map.set(hit.nodeId, { score: 1 / (k + idx + 1), hit });
+  });
+
+  ftsHits.forEach((hit, idx) => {
+    const rrf = 1 / (k + idx + 1);
+    const existing = map.get(hit.nodeId);
+    if (existing) {
+      existing.score += rrf;
+      if (existing.hit.excerpt.length < hit.excerpt.length) {
+        existing.hit = hit;
+      }
+    } else {
+      map.set(hit.nodeId, { score: rrf, hit });
+    }
+  });
+
+  return [...map.values()]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, maxResults)
+    .map((entry) => ({
+      ...entry.hit,
+      score: entry.score
+    }));
+}
+
+async function queryKnowledgeBase(client: LibsqlClient, query: string, limit = MAX_CONTEXT_ROWS): Promise<string> {
+  const embedding = await getQueryEmbedding(query);
+  const vectorHits = embedding ? await vectorSearch(embedding, limit * 2).catch(() => []) : [];
+  const ftsHits = await ftsSearch(query, limit * 2).catch(() => []);
+
+  let hits = fuseHybrid(vectorHits, ftsHits, limit);
+  let method = embedding ? "hybrid" : "fts";
+
+  if (!hits.length) {
+    hits = await nodeTextFallback(query, limit).catch(() => []);
+    method = "nodes_fallback";
+  }
+
+  if (!hits.length) {
+    return "No matching rows found in nodes/chunks tables.";
+  }
+
+  const lines = hits.map((hit, idx) => {
+    return (
+      `${idx + 1}. [${hit.eventDate || "unknown-date"}] ${hit.title}\n` +
+      `Desc: ${hit.description}\n` +
+      `Excerpt: ${hit.excerpt}\n` +
+      `Link: ${hit.link}`
+    );
+  });
+
+  return `Search method: ${method}\n\n${lines.join("\n\n")}`;
+}
+
+async function ensureDestinationChannel(message: Message, botName: string): Promise<DestinationChannel> {
+  if (message.channel.type === ChannelType.PublicThread || message.channel.type === ChannelType.PrivateThread) {
+    return message.channel as unknown as DestinationChannel;
+  }
+
+  const seed = message.content.trim().replace(/\s+/g, " ").slice(0, 40) || "discussion";
+  try {
+    const thread = await (message as Message<true>).startThread({
+      name: `${botName}: ${seed}`,
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+      reason: `${botName} conversation thread`
+    });
+    return thread as unknown as DestinationChannel;
+  } catch {
+    return message.channel as unknown as DestinationChannel;
+  }
+}
+
+async function generateResponse(profile: BotProfile, userPrompt: string, context: string): Promise<string> {
+  const payload = {
+    model: profile.model,
+    temperature: 0.6,
+    max_tokens: 700,
+    messages: [
+      {
+        role: "system",
+        content:
+          `${profile.systemPrompt}\n\n` +
+          "Use ONLY the supplied context when making factual claims. " +
+          "Return a compact answer and include a short 'Sources' list."
+      },
+      {
+        role: "user",
+        content: `User message:\n${userPrompt}\n\nContext:\n${context}`
+      }
+    ]
+  };
+
+  const response = await fetch(OPENROUTER_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`OpenRouter error (${response.status}): ${body.slice(0, 400)}`);
+  }
+
+  const data = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const text = data.choices?.[0]?.message?.content?.trim();
+
+  if (!text) {
+    throw new Error("OpenRouter returned empty response.");
+  }
+  return text;
+}
+
+async function maybeLogChat(
+  profile: BotProfile,
+  message: Message,
+  prompt: string,
+  response: string,
+  contextMethod: string
+): Promise<void> {
+  if (!ENABLE_CHAT_LOG_WRITE) return;
+  try {
+    await db.execute({
+      sql:
+        "INSERT INTO chats " +
+        "(bot_name, user_id, channel_id, message_id, prompt, response, retrieval_method, created_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      args: [
+        profile.name,
+        message.author.id,
+        message.channelId,
+        message.id,
+        prompt,
+        response.slice(0, 4000),
+        contextMethod,
+        new Date().toISOString()
+      ]
+    });
+  } catch {
+    // Logging is best-effort only.
+  }
+}
+
+function splitForDiscord(text: string): string[] {
+  const chunks: string[] = [];
+  let remaining = text.trim();
+  const limit = 1800;
+
+  while (remaining.length > limit) {
+    let splitAt = remaining.lastIndexOf("\n", limit);
+    if (splitAt < 400) splitAt = limit;
+    chunks.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+  }
+  if (remaining.length) chunks.push(remaining);
+  return chunks;
+}
+
+async function handleMessage(client: Client, profile: BotProfile, message: Message): Promise<void> {
+  if (processedMessageIds.has(message.id)) return;
+  const botUserId = client.user?.id;
+  if (!botUserId || !isAllowedChannel(message) || !shouldRespondToMessage(message, botUserId)) {
+    return;
+  }
+  if (!withinRateLimit(message)) return;
+  processedMessageIds.add(message.id);
+
+  const maybeCommand = parseCommand(cleanUserPrompt(message, botUserId));
+  const prompt = maybeCommand?.query || cleanUserPrompt(message, botUserId);
+  const destination = await ensureDestinationChannel(message, profile.name);
+  await destination.sendTyping();
+
+  const context = await queryKnowledgeBase(db, prompt);
+  const contextMethodLine = context.split("\n", 1)[0] || "Search method: unknown";
+
+  try {
+    if (maybeCommand?.command === "debate" && profile.name === "Sig") {
+      const debateKey = message.channelId;
+      if (activeDebates.has(debateKey)) {
+        await destination.send("A debate is already active in this channel. Wait for it to finish.");
+        return;
+      }
+
+      activeDebates.add(debateKey);
+      try {
+        for (let i = 0; i < MAX_DEBATE_EXCHANGES; i++) {
+          const sigOut = await generateResponse(
+            profiles[0],
+            `Debate round ${i + 1}. Take a factual position on: ${prompt}`,
+            context
+          );
+          await destination.send(`**Sig (${profiles[0].model})**\n${sigOut}`);
+
+          const slopOut = await generateResponse(
+            profiles[1],
+            `Debate round ${i + 1}. Respond to Sig and push a sharp counterpoint on: ${prompt}`,
+            context
+          );
+          await destination.send(`**Slop (${profiles[1].model})**\n${slopOut}`);
+        }
+      } finally {
+        activeDebates.delete(debateKey);
+      }
+      return;
+    }
+
+    const output = await generateResponse(profile, prompt, context);
+    const parts = splitForDiscord(output);
+    for (const part of parts) {
+      await destination.send(part);
+    }
+    await maybeLogChat(profile, message, prompt, output, contextMethodLine.replace("Search method: ", ""));
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    await destination.send(`${profile.name} hit an error while generating a response: ${msg}`);
+  }
+}
+
+async function handleInteraction(client: Client, profile: BotProfile, interaction: Interaction): Promise<void> {
+  if (!interaction.isChatInputCommand()) return;
+  if (!interaction.inGuild()) return;
+  if (interaction.user.bot) return;
+  if (ALLOWED_CHANNEL_IDS.size && !ALLOWED_CHANNEL_IDS.has(interaction.channelId || "")) {
+    return;
+  }
+
+  const command = interaction.commandName as "ask" | "search" | "episode" | "debate";
+  const query = interaction.options.getString("query", true).trim();
+  await interaction.deferReply();
+
+  if (command === "debate" && profile.name !== "Sig") {
+    await interaction.editReply("Debates are orchestrated by Sig.");
+    return;
+  }
+
+  const context = await queryKnowledgeBase(db, query);
+
+  if (command === "search") {
+    const snippets = context.length > 1800 ? `${context.slice(0, 1800)}...` : context;
+    await interaction.editReply(`Search context for "${query}":\n\n${snippets}`);
+    return;
+  }
+
+  if (command === "episode") {
+    const output = await generateResponse(
+      profile,
+      `Find episode-level answers for: ${query}. Focus on episodes, guests, dates, and links.`,
+      context
+    );
+    await interaction.editReply(output.slice(0, 1900));
+    return;
+  }
+
+  if (command === "debate") {
+    const rounds: string[] = [];
+    for (let i = 0; i < Math.min(MAX_DEBATE_EXCHANGES, 2); i++) {
+      const sig = await generateResponse(
+        profiles[0],
+        `Debate round ${i + 1}. Take a factual position on: ${query}`,
+        context
+      );
+      const slop = await generateResponse(
+        profiles[1],
+        `Debate round ${i + 1}. Counter Sig with a provocative take on: ${query}`,
+        context
+      );
+      rounds.push(`Sig: ${sig}\n\nSlop: ${slop}`);
+    }
+    await interaction.editReply(rounds.join("\n\n---\n\n").slice(0, 1900));
+    return;
+  }
+
+  const output = await generateResponse(profile, query, context);
+  await interaction.editReply(output.slice(0, 1900));
+}
+
+async function registerSlashCommands(profile: BotProfile): Promise<void> {
+  if (!profile.appId) {
+    console.log(`${profile.name}: BOT_APP_ID not provided; skipping slash command registration.`);
+    return;
+  }
+
+  const commands = [
+    new SlashCommandBuilder().setName("ask").setDescription("Ask the bot a KB-grounded question").addStringOption((opt) =>
+      opt.setName("query").setDescription("Question to ask").setRequired(true)
+    ),
+    new SlashCommandBuilder().setName("search").setDescription("Search KB context snippets").addStringOption((opt) =>
+      opt.setName("query").setDescription("Search query").setRequired(true)
+    ),
+    new SlashCommandBuilder().setName("episode").setDescription("Lookup episodes/guests").addStringOption((opt) =>
+      opt.setName("query").setDescription("Episode/guest lookup").setRequired(true)
+    ),
+    new SlashCommandBuilder().setName("debate").setDescription("Run Sig/Slop debate").addStringOption((opt) =>
+      opt.setName("query").setDescription("Debate topic").setRequired(true)
+    )
+  ].map((c) => c.toJSON());
+
+  const rest = new REST({ version: "10" }).setToken(profile.token);
+  if (DISCORD_TEST_GUILD_ID) {
+    await rest.put(Routes.applicationGuildCommands(profile.appId, DISCORD_TEST_GUILD_ID), { body: commands });
+    console.log(`${profile.name}: guild slash commands registered.`);
+  } else {
+    await rest.put(Routes.applicationCommands(profile.appId), { body: commands });
+    console.log(`${profile.name}: global slash commands registered.`);
+  }
+}
+
+async function startBot(profile: BotProfile): Promise<void> {
+  const client = new Client({
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+  });
+
+  client.once(Events.ClientReady, (readyClient) => {
+    console.log(`${profile.name} ready as ${readyClient.user.tag}`);
+  });
+
+  client.on(Events.InteractionCreate, async (interaction) => {
+    await handleInteraction(client, profile, interaction);
+  });
+
+  client.on(Events.MessageCreate, async (message) => {
+    await handleMessage(client, profile, message);
+  });
+
+  await registerSlashCommands(profile);
+  await client.login(profile.token);
+}
+
+async function main(): Promise<void> {
+  console.log("Starting Latent Space bots...");
+  if (ALLOWED_CHANNEL_IDS.size) {
+    console.log(`Allowed channels: ${[...ALLOWED_CHANNEL_IDS].join(", ")}`);
+  } else {
+    console.warn("ALLOWED_CHANNEL_IDS not set. Bots will respond in any channel they can read.");
+  }
+  await Promise.all(profiles.map((profile) => startBot(profile)));
+}
+
+main().catch((error) => {
+  console.error("Fatal bot startup error:", error);
+  process.exit(1);
+});
