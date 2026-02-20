@@ -231,7 +231,36 @@ async function ensureDestinationChannel(message: Message, botName: string): Prom
   }
 }
 
-async function generateResponse(profile: BotProfile, userPrompt: string, context: string): Promise<string> {
+function isGreetingOrSmalltalk(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return false;
+  const simple = new Set([
+    "hi",
+    "hello",
+    "hey",
+    "yo",
+    "sup",
+    "how are you",
+    "whats up",
+    "what's up",
+    "gm",
+    "good morning",
+    "good afternoon",
+    "good evening"
+  ]);
+  return simple.has(normalized);
+}
+
+async function generateResponse(
+  profile: BotProfile,
+  userPrompt: string,
+  context: string,
+  options?: { requireSources?: boolean }
+): Promise<string> {
+  const requireSources = options?.requireSources ?? true;
+  const groundingLine = requireSources
+    ? "Use ONLY the supplied context when making factual claims. Return a compact answer and include a short 'Sources' list."
+    : "You can respond conversationally for greetings/smalltalk. Do not fabricate factual claims.";
   const payload = {
     model: profile.model,
     temperature: 0.6,
@@ -239,10 +268,7 @@ async function generateResponse(profile: BotProfile, userPrompt: string, context
     messages: [
       {
         role: "system",
-        content:
-          `${profile.systemPrompt}\n\n` +
-          "Use ONLY the supplied context when making factual claims. " +
-          "Return a compact answer and include a short 'Sources' list."
+        content: `${profile.systemPrompt}\n\n${groundingLine}`
       },
       {
         role: "user",
@@ -335,7 +361,10 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   const destination = await ensureDestinationChannel(message, profile.name);
   await destination.sendTyping();
 
-  const contextResult = await queryKnowledgeBase(prompt);
+  const smalltalk = !maybeCommand && isGreetingOrSmalltalk(prompt);
+  const contextResult = smalltalk
+    ? { method: "smalltalk", text: "No graph retrieval needed for greeting/smalltalk." }
+    : await queryKnowledgeBase(prompt);
   const context = contextResult.text;
   const contextMethodLine = `Search method: ${contextResult.method}`;
 
@@ -370,7 +399,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
       return;
     }
 
-    const output = await generateResponse(profile, prompt, context);
+    const output = await generateResponse(profile, prompt, context, { requireSources: !smalltalk });
     const parts = splitForDiscord(output);
     for (const part of parts) {
       await destination.send(part);
@@ -399,7 +428,10 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
     return;
   }
 
-  const contextResult = await queryKnowledgeBase(query);
+  const smalltalk = command === "ask" && isGreetingOrSmalltalk(query);
+  const contextResult = smalltalk
+    ? { method: "smalltalk", text: "No graph retrieval needed for greeting/smalltalk." }
+    : await queryKnowledgeBase(query);
   const context = contextResult.text;
 
   if (command === "search") {
@@ -437,8 +469,8 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
     return;
   }
 
-  const output = await generateResponse(profile, query, context);
-  await interaction.editReply(output.slice(0, 1900));
+    const output = await generateResponse(profile, query, context, { requireSources: !smalltalk });
+    await interaction.editReply(output.slice(0, 1900));
 }
 
 async function registerSlashCommands(profile: BotProfile): Promise<void> {
