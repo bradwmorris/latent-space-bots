@@ -341,6 +341,29 @@ async function queryLatestContent(
   };
 }
 
+function shortModelName(model: string): string {
+  const trimmed = model.trim();
+  if (!trimmed) return "unknown-model";
+  const parts = trimmed.split("/");
+  return parts[parts.length - 1] || trimmed;
+}
+
+function modelBadge(model: string): string {
+  return `🤖 ${shortModelName(model)}`;
+}
+
+function formatToolMethod(method: string): string {
+  if (!method || method === "unknown") return "lookup";
+  if (method === "smalltalk") return "none";
+  if (method.startsWith("latest_node_lookup:")) return `latest:${method.split(":")[1] || "content"}`;
+  if (method === "latest_node_lookup") return "latest:content";
+  return method;
+}
+
+function toolsFooter(method: string): string {
+  return `🛠️ ${formatToolMethod(method)}`;
+}
+
 async function ensureDestinationChannel(message: Message, botName: string): Promise<DestinationChannel> {
   if (message.channel.type === ChannelType.PublicThread || message.channel.type === ChannelType.PrivateThread) {
     return message.channel as unknown as DestinationChannel;
@@ -386,6 +409,10 @@ async function generateResponse(
   options?: { requireSources?: boolean }
 ): Promise<string> {
   const requireSources = options?.requireSources ?? true;
+  const profileStyleLine =
+    profile.name === "Sig"
+      ? "Style for Sig: extremely concise. 1-4 short paragraphs or bullets max. Always include concrete date/event_date context when relevant. Include a short 'Sources' section with verbatim quote snippets (max ~12 words each) and URL links. No filler."
+      : "Style for Slop: opinionated, sharp, slightly unhinged tone. Keep it concise but punchy. Still ground factual claims in provided context and include source links when making factual claims.";
   const groundingLine = requireSources
     ? "Use ONLY the supplied context when making factual claims. Return a compact answer and include a short 'Sources' list."
     : "You can respond conversationally for greetings/smalltalk. Do not fabricate factual claims.";
@@ -396,7 +423,7 @@ async function generateResponse(
     messages: [
       {
         role: "system",
-        content: `${profile.systemPrompt}\n\n${groundingLine}`
+        content: `${profile.systemPrompt}\n\n${groundingLine}\n${profileStyleLine}`
       },
       {
         role: "user",
@@ -710,9 +737,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
 
       activeDebates.add(debateKey);
       try {
-        await destination.send(
-          `_Model(s): ${profiles[0].model}, ${profiles[1].model} | Tools: ls_query_knowledge_context (${contextResult.method})_`
-        );
+        await destination.send(`🤖 ${shortModelName(profiles[0].model)} + ${shortModelName(profiles[1].model)}`);
         for (let i = 0; i < MAX_DEBATE_EXCHANGES; i++) {
           const sigOut = await generateResponse(
             profiles[0],
@@ -728,6 +753,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
           );
           await destination.send(`**Slop (${profiles[1].model})**\n${slopOut}`);
         }
+        await destination.send(toolsFooter(contextResult.method));
       } finally {
         activeDebates.delete(debateKey);
       }
@@ -735,11 +761,12 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
     }
 
     const output = await generateResponse(profile, prompt, context, { requireSources: !smalltalk });
+    await destination.send(modelBadge(profile.model));
     const parts = splitForDiscord(output);
     for (const part of parts) {
       await destination.send(part);
     }
-    await destination.send(`_Model: ${profile.model} | Tools: ls_query_knowledge_context (${contextResult.method})_`);
+    await destination.send(toolsFooter(contextResult.method));
     await maybeLogChat(profile, message, prompt, output, contextMethodLine.replace("Search method: ", ""));
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
@@ -773,7 +800,7 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
   if (command === "search") {
     const snippets = context.length > 1800 ? `${context.slice(0, 1800)}...` : context;
     await interaction.editReply(
-      `Search context for "${query}":\n\n${snippets}\n\n_Model: ${profile.model} | Tools: ls_query_knowledge_context (${contextResult.method})_`
+      `${modelBadge(profile.model)}\n\nSearch context for "${query}":\n\n${snippets}\n\n${toolsFooter(contextResult.method)}`
     );
     return;
   }
@@ -785,7 +812,7 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
       context
     );
     await interaction.editReply(
-      `${output}\n\n_Model: ${profile.model} | Tools: ls_query_knowledge_context (${contextResult.method})_`.slice(0, 1900)
+      `${modelBadge(profile.model)}\n\n${output}\n\n${toolsFooter(contextResult.method)}`.slice(0, 1900)
     );
     return;
   }
@@ -806,7 +833,7 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
       rounds.push(`Sig: ${sig}\n\nSlop: ${slop}`);
     }
     await interaction.editReply(
-      `${rounds.join("\n\n---\n\n")}\n\n_Model(s): ${profiles[0].model}, ${profiles[1].model} | Tools: ls_query_knowledge_context (${contextResult.method})_`.slice(
+      `🤖 ${shortModelName(profiles[0].model)} + ${shortModelName(profiles[1].model)}\n\n${rounds.join("\n\n---\n\n")}\n\n${toolsFooter(contextResult.method)}`.slice(
         0,
         1900
       )
@@ -816,7 +843,7 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
 
     const output = await generateResponse(profile, query, context, { requireSources: !smalltalk });
     await interaction.editReply(
-      `${output}\n\n_Model: ${profile.model} | Tools: ls_query_knowledge_context (${contextResult.method})_`.slice(0, 1900)
+      `${modelBadge(profile.model)}\n\n${output}\n\n${toolsFooter(contextResult.method)}`.slice(0, 1900)
     );
 }
 
