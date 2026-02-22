@@ -681,8 +681,21 @@ function startKickoffServer(): void {
       }
 
       const body = (await readJsonBody(req)) as KickoffPayload;
-      const result = await runDeterministicKickoff(body || {});
-      writeJson(res, 200, result);
+      const kickoffPayload = body || {};
+      const kickoffId = `${Date.now()}`;
+
+      // Return quickly so upstream ingestion hooks don't timeout while debate generation runs.
+      writeJson(res, 202, { ok: true, accepted: true, kickoffId });
+
+      queueMicrotask(async () => {
+        try {
+          const result = await runDeterministicKickoff(kickoffPayload);
+          console.log(`[kickoff:${kickoffId}] completed`, result);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error(`[kickoff:${kickoffId}] failed: ${message}`);
+        }
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       writeJson(res, 500, { ok: false, error: message });
