@@ -87,6 +87,12 @@ type KickoffPayload = {
   exchanges?: number;
 };
 
+type ContentNodeType = "podcast" | "article" | "ainews" | "builders-club" | "paper-club" | "workshop";
+type RetrievalIntent = {
+  wantsLatest: boolean;
+  requestedType?: ContentNodeType;
+};
+
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const MAX_CONTEXT_ROWS = 6;
 const processedMessageIds = new Set<string>();
@@ -251,6 +257,17 @@ function withinRateLimit(message: Message, options?: { ownedThread?: boolean }):
 }
 
 async function queryKnowledgeBase(query: string, limit = MAX_CONTEXT_ROWS): Promise<{ method: string; text: string }> {
+  const intent = inferRetrievalIntent(query);
+  if (intent.wantsLatest) {
+    const latest = await queryLatestContent(intent.requestedType);
+    if (latest) {
+      return {
+        method: latest.method,
+        text: latest.text
+      };
+    }
+  }
+
   const result = await lsHubServices.queryKnowledgeContext(query, {
     limit,
     openAiApiKey: OPENAI_API_KEY || undefined
@@ -258,6 +275,69 @@ async function queryKnowledgeBase(query: string, limit = MAX_CONTEXT_ROWS): Prom
   return {
     method: result.method || "unknown",
     text: result.text || "No matching rows found in nodes/chunks tables."
+  };
+}
+
+function inferRetrievalIntent(query: string): RetrievalIntent {
+  const text = query.toLowerCase();
+  const wantsLatest = /\b(latest|most recent|newest|just dropped|recently published)\b/.test(text);
+
+  if (!wantsLatest) {
+    return { wantsLatest: false };
+  }
+
+  if (/\b(podcast|episode)\b/.test(text)) return { wantsLatest: true, requestedType: "podcast" };
+  if (/\b(article|blog|substack)\b/.test(text)) return { wantsLatest: true, requestedType: "article" };
+  if (/\b(ai\s*news|ainews|newsletter)\b/.test(text)) return { wantsLatest: true, requestedType: "ainews" };
+  if (/\b(builders?\s*club|meetup)\b/.test(text)) return { wantsLatest: true, requestedType: "builders-club" };
+  if (/\b(paper\s*club)\b/.test(text)) return { wantsLatest: true, requestedType: "paper-club" };
+  if (/\b(workshop)\b/.test(text)) return { wantsLatest: true, requestedType: "workshop" };
+
+  return { wantsLatest: true };
+}
+
+async function queryLatestContent(
+  nodeType?: ContentNodeType
+): Promise<{ method: string; text: string } | null> {
+  const contentTypes: ContentNodeType[] = [
+    "podcast",
+    "article",
+    "ainews",
+    "builders-club",
+    "paper-club",
+    "workshop"
+  ];
+
+  const sql =
+    "SELECT id, title, node_type, event_date, coalesce(description, '') AS description, " +
+    "substr(coalesce(notes, ''), 1, 700) AS excerpt, coalesce(link, '') AS link " +
+    "FROM nodes " +
+    "WHERE event_date IS NOT NULL " +
+    (nodeType
+      ? "AND node_type = ? "
+      : `AND node_type IN (${contentTypes.map(() => "?").join(",")}) `) +
+    "ORDER BY event_date DESC, updated_at DESC " +
+    "LIMIT 3";
+
+  const args: string[] = nodeType ? [nodeType] : contentTypes;
+  const result = await db.execute({ sql, args });
+  const rows = result.rows || [];
+  if (!rows.length) return null;
+
+  const lines = rows.map((row, idx) => {
+    const type = String(row.node_type || "unknown");
+    const date = String(row.event_date || "unknown-date");
+    return (
+      `${idx + 1}. [${date}] (${type}) ${String(row.title || "Untitled")}\n` +
+      `Desc: ${String(row.description || "")}\n` +
+      `Excerpt: ${String(row.excerpt || "")}\n` +
+      `Link: ${String(row.link || "")}`
+    );
+  });
+
+  return {
+    method: nodeType ? `latest_node_lookup:${nodeType}` : "latest_node_lookup",
+    text: `Search method: latest_node_lookup\n\n${lines.join("\n\n")}`
   };
 }
 
@@ -630,6 +710,9 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
 
       activeDebates.add(debateKey);
       try {
+        await destination.send(
+          `_Model(s): ${profiles[0].model}, ${profiles[1].model} | Tools: ls_query_knowledge_context (${contextResult.method})_`
+        );
         for (let i = 0; i < MAX_DEBATE_EXCHANGES; i++) {
           const sigOut = await generateResponse(
             profiles[0],
@@ -656,6 +739,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
     for (const part of parts) {
       await destination.send(part);
     }
+    await destination.send(`_Model: ${profile.model} | Tools: ls_query_knowledge_context (${contextResult.method})_`);
     await maybeLogChat(profile, message, prompt, output, contextMethodLine.replace("Search method: ", ""));
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
@@ -688,7 +772,9 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
 
   if (command === "search") {
     const snippets = context.length > 1800 ? `${context.slice(0, 1800)}...` : context;
-    await interaction.editReply(`Search context for "${query}":\n\n${snippets}`);
+    await interaction.editReply(
+      `Search context for "${query}":\n\n${snippets}\n\n_Model: ${profile.model} | Tools: ls_query_knowledge_context (${contextResult.method})_`
+    );
     return;
   }
 
@@ -698,7 +784,9 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
       `Find episode-level answers for: ${query}. Focus on episodes, guests, dates, and links.`,
       context
     );
-    await interaction.editReply(output.slice(0, 1900));
+    await interaction.editReply(
+      `${output}\n\n_Model: ${profile.model} | Tools: ls_query_knowledge_context (${contextResult.method})_`.slice(0, 1900)
+    );
     return;
   }
 
@@ -717,12 +805,19 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
       );
       rounds.push(`Sig: ${sig}\n\nSlop: ${slop}`);
     }
-    await interaction.editReply(rounds.join("\n\n---\n\n").slice(0, 1900));
+    await interaction.editReply(
+      `${rounds.join("\n\n---\n\n")}\n\n_Model(s): ${profiles[0].model}, ${profiles[1].model} | Tools: ls_query_knowledge_context (${contextResult.method})_`.slice(
+        0,
+        1900
+      )
+    );
     return;
   }
 
     const output = await generateResponse(profile, query, context, { requireSources: !smalltalk });
-    await interaction.editReply(output.slice(0, 1900));
+    await interaction.editReply(
+      `${output}\n\n_Model: ${profile.model} | Tools: ls_query_knowledge_context (${contextResult.method})_`.slice(0, 1900)
+    );
 }
 
 async function registerSlashCommands(profile: BotProfile): Promise<void> {
