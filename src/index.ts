@@ -241,18 +241,24 @@ function isAllowedChannel(message: Message): boolean {
   return ALLOWED_CHANNEL_IDS.has(message.channelId);
 }
 
-function withinRateLimit(message: Message, options?: { ownedThread?: boolean }): boolean {
+function withinRateLimit(
+  message: Message,
+  profileName: BotProfile["name"],
+  options?: { ownedThread?: boolean }
+): boolean {
   const now = Date.now();
-  const userLast = rateLimitByUser.get(message.author.id) || 0;
-  const channelLast = rateLimitByChannel.get(message.channelId) || 0;
+  const userKey = `${profileName}:${message.author.id}`;
+  const channelKey = `${profileName}:${message.channelId}`;
+  const userLast = rateLimitByUser.get(userKey) || 0;
+  const channelLast = rateLimitByChannel.get(channelKey) || 0;
   const ownedThread = Boolean(options?.ownedThread);
 
   // In bot-owned threads we relax per-user cooldown to keep natural back-and-forth.
   if (!ownedThread && now - userLast < USER_RATE_LIMIT_WINDOW_MS) return false;
   if (now - channelLast < CHANNEL_RATE_LIMIT_WINDOW_MS) return false;
 
-  rateLimitByUser.set(message.author.id, now);
-  rateLimitByChannel.set(message.channelId, now);
+  rateLimitByUser.set(userKey, now);
+  rateLimitByChannel.set(channelKey, now);
   return true;
 }
 
@@ -726,7 +732,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   }
   const owner = getThreadOwnerBotName(message);
   const ownedThread = owner === profile.name;
-  if (!withinRateLimit(message, { ownedThread })) return;
+  if (!withinRateLimit(message, profile.name, { ownedThread })) return;
   processedMessageIds.add(dedupeKey);
 
   const maybeCommand = parseCommand(cleanUserPrompt(message, botUserId));
