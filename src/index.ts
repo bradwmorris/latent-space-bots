@@ -718,7 +718,8 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
     );
   }
 
-  if (processedMessageIds.has(message.id)) return;
+  const dedupeKey = `${profile.name}:${message.id}`;
+  if (processedMessageIds.has(dedupeKey)) return;
   const botUserId = client.user?.id;
   if (!botUserId || !isAllowedChannel(message) || !shouldRespondToMessage(message, botUserId, profile.name)) {
     return;
@@ -726,7 +727,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   const owner = getThreadOwnerBotName(message);
   const ownedThread = owner === profile.name;
   if (!withinRateLimit(message, { ownedThread })) return;
-  processedMessageIds.add(message.id);
+  processedMessageIds.add(dedupeKey);
 
   const maybeCommand = parseCommand(cleanUserPrompt(message, botUserId));
   const prompt = maybeCommand?.query || cleanUserPrompt(message, botUserId);
