@@ -2,7 +2,7 @@
   "name": "latent-space-bots",
   "version": "0.1.0",
   "private": true,
-  "description": "Discord bots for Latent Space (Sig + Slop)",
+  "description": "Slop — Discord bot for Latent Space",
   "type": "commonjs",
   "engines": {
     "node": ">=22"

@@ -55,7 +55,7 @@ function loadSharedServicesFactory(): {
 const { createLsHubServices } = loadSharedServicesFactory();
 
 type BotProfile = {
-  name: "Sig" | "Slop";
+  name: "Slop";
   token: string;
   model: string;
   systemPrompt: string;
@@ -63,7 +63,7 @@ type BotProfile = {
 };
 
 type BotProfileSeed = {
-  name: "Sig" | "Slop";
+  name: "Slop";
   token: string;
   model: string;
   soulFile: string;
@@ -112,8 +112,7 @@ const TURSO_AUTH_TOKEN = requiredEnv("TURSO_AUTH_TOKEN");
 const OPENROUTER_API_KEY = requiredEnv("OPENROUTER_API_KEY");
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
-const SIG_MODEL = process.env.SIG_MODEL || "anthropic/claude-sonnet-4";
-const SLOP_MODEL = process.env.SLOP_MODEL || "moonshotai/kimi-k2";
+const SLOP_MODEL = process.env.SLOP_MODEL || "anthropic/claude-sonnet-4-6";
 const DISCORD_TEST_GUILD_ID = process.env.DISCORD_TEST_GUILD_ID || "";
 const ALLOWED_CHANNEL_IDS = new Set(
   (process.env.ALLOWED_CHANNEL_IDS || "")
@@ -136,14 +135,7 @@ const db = createLibsqlClient({
 });
 const lsHubServices = createLsHubServices({ db });
 
-const allProfileSeeds: BotProfileSeed[] = [
-  {
-    name: "Sig",
-    token: process.env.BOT_TOKEN_SIG || "",
-    model: SIG_MODEL,
-    appId: process.env.BOT_APP_ID_SIG,
-    soulFile: "sig.soul.md"
-  },
+const profileSeeds: BotProfileSeed[] = [
   {
     name: "Slop",
     token: requiredEnv("BOT_TOKEN_SLOP"),
@@ -152,7 +144,6 @@ const allProfileSeeds: BotProfileSeed[] = [
     soulFile: "slop.soul.md"
   }
 ];
-const profileSeeds = allProfileSeeds.filter((seed) => seed.token.length > 0);
 
 function readSoulDocument(filename: string): string {
   const soulPath = path.join(process.cwd(), "personas", filename);
@@ -193,7 +184,6 @@ function getThreadOwnerBotName(message: Message): BotProfile["name"] | null {
   }
 
   const threadName = (message.channel.name || "").trim().toLowerCase();
-  if (threadName.startsWith("sig:")) return "Sig";
   if (threadName.startsWith("slop:")) return "Slop";
   return null;
 }
@@ -335,11 +325,14 @@ async function queryLatestContent(
   const lines = rows.map((row, idx) => {
     const type = String(row.node_type || "unknown");
     const date = String(row.event_date || "unknown-date");
+    const title = String(row.title || "Untitled");
+    const link = String(row.link || "");
+    const titleLine = link ? `[${title}](${link})` : title;
     return (
-      `${idx + 1}. [${date}] (${type}) ${String(row.title || "Untitled")}\n` +
+      `${idx + 1}. [${date}] (${type}) ${titleLine}\n` +
       `Desc: ${String(row.description || "")}\n` +
       `Excerpt: ${String(row.excerpt || "")}\n` +
-      `Link: ${String(row.link || "")}`
+      `Link: ${link}`
     );
   });
 
@@ -418,11 +411,9 @@ async function generateResponse(
 ): Promise<string> {
   const requireSources = options?.requireSources ?? true;
   const profileStyleLine =
-    profile.name === "Sig"
-      ? "Style for Sig: extremely concise. 1-4 short paragraphs or bullets max. Always include concrete date/event_date context when relevant. Include a short 'Sources' section with verbatim quote snippets (max ~12 words each) and URL links. No filler."
-      : "Style for Slop: opinionated, sharp, slightly unhinged tone. Keep it concise but punchy. Still ground factual claims in provided context and include source links when making factual claims.";
+    "Style: opinionated, sharp, slightly unhinged tone. Keep it concise but punchy. Still ground factual claims in provided context. IMPORTANT: When referencing specific content (episodes, articles, AINews), always include the direct link. Format: [Title](url). Never reference content without linking to it.";
   const groundingLine = requireSources
-    ? "Use ONLY the supplied context when making factual claims. Return a compact answer and include a short 'Sources' list."
+    ? "Use ONLY the supplied context when making factual claims. Return a compact answer and include a short 'Sources' list with direct links. The context includes markdown links like [Title](url) — pass these through in your response so users can click to the source."
     : "You can respond conversationally for greetings/smalltalk. Do not fabricate factual claims.";
   const payload = {
     model: profile.model,

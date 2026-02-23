@@ -186,8 +186,9 @@ export function createLsHubServices(options: { db: LibsqlClient }) {
       }
 
       const lines = hits.map((hit, idx) => {
+        const titleLine = hit.link ? `[${hit.title}](${hit.link})` : hit.title;
         return (
-          `${idx + 1}. [${hit.eventDate || "unknown-date"}] ${hit.title}\n` +
+          `${idx + 1}. [${hit.eventDate || "unknown-date"}] ${titleLine}\n` +
           `Desc: ${hit.description}\n` +
           `Excerpt: ${hit.excerpt}\n` +
           `Link: ${hit.link}`
