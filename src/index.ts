@@ -12,7 +12,6 @@ import {
   Routes,
   SlashCommandBuilder,
   ThreadAutoArchiveDuration,
-  type ChatInputCommandInteraction,
   type GuildTextBasedChannel,
   type Interaction,
   type Message
@@ -124,14 +123,11 @@ const ALLOWED_CHANNEL_IDS = new Set(
 );
 const USER_RATE_LIMIT_WINDOW_MS = Number(process.env.USER_RATE_LIMIT_WINDOW_MS || 5000);
 const CHANNEL_RATE_LIMIT_WINDOW_MS = Number(process.env.CHANNEL_RATE_LIMIT_WINDOW_MS || 1200);
-const MAX_DEBATE_EXCHANGES = Number(process.env.MAX_DEBATE_EXCHANGES || 4);
 const ENABLE_CHAT_LOG_WRITE = String(process.env.ENABLE_CHAT_LOG_WRITE || "false").toLowerCase() === "true";
 const DEBATE_KICKOFF_SECRET = process.env.DEBATE_KICKOFF_SECRET || "";
 const DEBATE_KICKOFF_PORT = Number(process.env.DEBATE_KICKOFF_PORT || 8787);
 const DEBATE_KICKOFF_HOST = process.env.DEBATE_KICKOFF_HOST || "0.0.0.0";
 const BOT_TALK_CHANNEL_ID = process.env.BOT_TALK_CHANNEL_ID || "";
-const MAX_KICKOFF_EXCHANGES = Math.min(Math.max(Number(process.env.MAX_KICKOFF_EXCHANGES || 2), 1), 3);
-
 const clientsByProfile = new Map<BotProfile["name"], Client>();
 
 const db = createLibsqlClient({
@@ -140,10 +136,10 @@ const db = createLibsqlClient({
 });
 const lsHubServices = createLsHubServices({ db });
 
-const profileSeeds: BotProfileSeed[] = [
+const allProfileSeeds: BotProfileSeed[] = [
   {
     name: "Sig",
-    token: requiredEnv("BOT_TOKEN_SIG"),
+    token: process.env.BOT_TOKEN_SIG || "",
     model: SIG_MODEL,
     appId: process.env.BOT_APP_ID_SIG,
     soulFile: "sig.soul.md"
@@ -156,6 +152,7 @@ const profileSeeds: BotProfileSeed[] = [
     soulFile: "slop.soul.md"
   }
 ];
+const profileSeeds = allProfileSeeds.filter((seed) => seed.token.length > 0);
 
 function readSoulDocument(filename: string): string {
   const soulPath = path.join(process.cwd(), "personas", filename);
@@ -225,13 +222,17 @@ function shouldRespondToMessage(message: Message, botUserId: string, profileName
   return directlyMentioned || replyToBot;
 }
 
-function parseCommand(content: string): { command: "ask" | "search" | "episode" | "debate"; query: string } | null {
+function parseCommand(content: string): { command: "tldr" | "wassup"; query: string } | null {
   const trimmed = content.trim();
-  const regex = /^\/(ask|search|episode|debate)\s+([\s\S]+)$/i;
+  // /wassup can be used with no arguments
+  const wassupMatch = trimmed.match(/^\/wassup\s*$/i);
+  if (wassupMatch) return { command: "wassup", query: "" };
+  // /tldr requires a query, /wassup can optionally have one too
+  const regex = /^\/(tldr|wassup)\s+([\s\S]+)$/i;
   const match = trimmed.match(regex);
   if (!match) return null;
   return {
-    command: match[1].toLowerCase() as "ask" | "search" | "episode" | "debate",
+    command: match[1].toLowerCase() as "tldr" | "wassup",
     query: match[2].trim()
   };
 }
@@ -303,7 +304,8 @@ function inferRetrievalIntent(query: string): RetrievalIntent {
 }
 
 async function queryLatestContent(
-  nodeType?: ContentNodeType
+  nodeType?: ContentNodeType,
+  limit = 3
 ): Promise<{ method: string; text: string } | null> {
   const contentTypes: ContentNodeType[] = [
     "podcast",
@@ -323,7 +325,7 @@ async function queryLatestContent(
       ? "AND node_type = ? "
       : `AND node_type IN (${contentTypes.map(() => "?").join(",")}) `) +
     "ORDER BY event_date DESC, updated_at DESC " +
-    "LIMIT 3";
+    `LIMIT ${Math.max(1, Math.floor(limit))}`;
 
   const args: string[] = nodeType ? [nodeType] : contentTypes;
   const result = await db.execute({ sql, args });
@@ -522,12 +524,6 @@ function getReadyClient(name: BotProfile["name"]): Client {
   return client;
 }
 
-function normalizeKickoffExchanges(raw: unknown): number {
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed)) return MAX_KICKOFF_EXCHANGES;
-  return Math.min(Math.max(Math.floor(parsed), 1), MAX_KICKOFF_EXCHANGES);
-}
-
 function buildKickoffQuery(payload: KickoffPayload): string {
   const candidate =
     payload.prompt ||
@@ -537,13 +533,13 @@ function buildKickoffQuery(payload: KickoffPayload): string {
   return candidate?.trim() || "Summarize the most recent Latent Space content and why it matters.";
 }
 
-async function resolveKickoffDestination(sigClient: Client, payload: KickoffPayload): Promise<DestinationChannel> {
+async function resolveKickoffDestination(client: Client, payload: KickoffPayload): Promise<DestinationChannel> {
   const channelId = (payload.channelId || BOT_TALK_CHANNEL_ID || "").trim();
   if (!channelId) {
     throw new Error("No kickoff channel configured. Set BOT_TALK_CHANNEL_ID or include channelId in request.");
   }
 
-  const channel = await sigClient.channels.fetch(channelId);
+  const channel = await client.channels.fetch(channelId);
   if (!channel || !channel.isTextBased()) {
     throw new Error(`Channel ${channelId} is not text-based or is inaccessible.`);
   }
@@ -553,7 +549,7 @@ async function resolveKickoffDestination(sigClient: Client, payload: KickoffPayl
   }
 
   const seedParts = [
-    "New content ingested. Starting Sig vs Slop.",
+    "New content ingested.",
     payload.title ? `Title: ${payload.title}` : "",
     payload.contentType ? `Type: ${payload.contentType}` : "",
     payload.eventDate ? `Date: ${payload.eventDate}` : "",
@@ -569,9 +565,9 @@ async function resolveKickoffDestination(sigClient: Client, payload: KickoffPayl
 
   try {
     const thread = await kickoffMessage.startThread({
-      name: `Sig vs Slop: ${threadTitleSeed || "new-content"}`,
+      name: `Slop: ${threadTitleSeed || "new-content"}`,
       autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
-      reason: "Deterministic kickoff for newly ingested content"
+      reason: "Kickoff for newly ingested content"
     });
     return thread as unknown as DestinationChannel;
   } catch {
@@ -579,64 +575,42 @@ async function resolveKickoffDestination(sigClient: Client, payload: KickoffPayl
   }
 }
 
-async function runDeterministicKickoff(payload: KickoffPayload): Promise<{ ok: true; exchanges: number }> {
-  const sigProfile = getProfileByName("Sig");
+async function runDeterministicKickoff(payload: KickoffPayload): Promise<{ ok: true }> {
   const slopProfile = getProfileByName("Slop");
-  const sigClient = getReadyClient("Sig");
+  const slopClient = getReadyClient("Slop");
 
-  const destination = await resolveKickoffDestination(sigClient, payload);
+  const destination = await resolveKickoffDestination(slopClient, payload);
   const query = buildKickoffQuery(payload);
   const contextResult = await queryKnowledgeBase(query);
   const context = contextResult.text;
-  const exchanges = normalizeKickoffExchanges(payload.exchanges);
-  const debateKey = `kickoff:${payload.channelId || BOT_TALK_CHANNEL_ID || "unknown"}`;
+  const kickoffKey = `kickoff:${payload.channelId || BOT_TALK_CHANNEL_ID || "unknown"}`;
 
-  if (activeDebates.has(debateKey)) {
-    throw new Error("A kickoff debate is already running for this channel.");
+  if (activeDebates.has(kickoffKey)) {
+    throw new Error("A kickoff is already running for this channel.");
   }
 
-  activeDebates.add(debateKey);
+  activeDebates.add(kickoffKey);
   try {
-    let priorSig = "";
-    let priorSlop = "";
-    for (let i = 0; i < exchanges; i++) {
-      const roundLabel = `Round ${i + 1}/${exchanges}`;
-      const sigPrompt =
-        i === 0
-          ? [
-              "Kick off a new-content discussion for Latent Space.",
-              `Context query: ${query}`,
-              payload.title ? `Title: ${payload.title}` : "",
-              payload.contentType ? `Type: ${payload.contentType}` : "",
-              payload.eventDate ? `Date: ${payload.eventDate}` : "",
-              payload.url ? `URL: ${payload.url}` : "",
-              "Summarize what is new, why it matters, and cite sources."
-            ]
-              .filter(Boolean)
-              .join("\n")
-          : [
-              "Continue the Sig vs Slop debate with factual grounding.",
-              `Previous Slop point: ${priorSlop || "N/A"}`,
-              `Topic: ${query}`
-            ].join("\n");
+    const slopPrompt = [
+      "New content just dropped in Latent Space. Break it down.",
+      `Context query: ${query}`,
+      payload.title ? `Title: ${payload.title}` : "",
+      payload.contentType ? `Type: ${payload.contentType}` : "",
+      payload.eventDate ? `Date: ${payload.eventDate}` : "",
+      payload.url ? `URL: ${payload.url}` : "",
+      "Summarize what's new, why it matters, and give your take. Cite sources."
+    ]
+      .filter(Boolean)
+      .join("\n");
 
-      priorSig = await generateResponse(sigProfile, sigPrompt, context);
-      await destination.send(`**Sig (${sigProfile.model}) — ${roundLabel}**\n${priorSig}`);
-
-      const slopPrompt = [
-        "Respond to Sig with a grounded counterpoint.",
-        `Sig just said: ${priorSig}`,
-        "Be provocative but cite concrete evidence from the provided context."
-      ].join("\n");
-
-      priorSlop = await generateResponse(slopProfile, slopPrompt, context);
-      await destination.send(`**Slop (${slopProfile.model}) — ${roundLabel}**\n${priorSlop}`);
-    }
+    const output = await generateResponse(slopProfile, slopPrompt, context);
+    await destination.send(`${modelBadge(slopProfile.model)}\n${output}`);
+    await destination.send(toolsFooter(contextResult.method));
   } finally {
-    activeDebates.delete(debateKey);
+    activeDebates.delete(kickoffKey);
   }
 
-  return { ok: true, exchanges };
+  return { ok: true };
 }
 
 function writeJson(res: http.ServerResponse, statusCode: number, payload: unknown): void {
@@ -740,6 +714,30 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   const destination = await ensureDestinationChannel(message, profile.name);
   await destination.sendTyping();
 
+  // /wassup fetches its own context, skip general KB query
+  if (maybeCommand?.command === "wassup") {
+    try {
+      const latest = await queryLatestContent(undefined, 6);
+      const wassupContext = latest?.text || "No recent content found.";
+      const wassupMethod = latest?.method || "latest_node_lookup";
+      const output = await generateResponse(
+        profile,
+        "What's new in Latent Space? Summarize the most interesting recent content — what dropped, why it matters, and what builders should pay attention to.",
+        wassupContext
+      );
+      await destination.send(modelBadge(profile.model));
+      const parts = splitForDiscord(output);
+      for (const part of parts) {
+        await destination.send(part);
+      }
+      await destination.send(toolsFooter(wassupMethod));
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await destination.send(`${profile.name} hit an error while generating a response: ${msg}`);
+    }
+    return;
+  }
+
   const smalltalk = !maybeCommand && isGreetingOrSmalltalk(prompt);
   const contextResult = smalltalk
     ? { method: "smalltalk", text: "No graph retrieval needed for greeting/smalltalk." }
@@ -748,39 +746,11 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   const contextMethodLine = `Search method: ${contextResult.method}`;
 
   try {
-    if (maybeCommand?.command === "debate" && profile.name === "Sig") {
-      const debateKey = message.channelId;
-      if (activeDebates.has(debateKey)) {
-        await destination.send("A debate is already active in this channel. Wait for it to finish.");
-        return;
-      }
-
-      activeDebates.add(debateKey);
-      try {
-        await destination.send(`🤖 ${shortModelName(profiles[0].model)} + ${shortModelName(profiles[1].model)}`);
-        for (let i = 0; i < MAX_DEBATE_EXCHANGES; i++) {
-          const sigOut = await generateResponse(
-            profiles[0],
-            `Debate round ${i + 1}. Take a factual position on: ${prompt}`,
-            context
-          );
-          await destination.send(`**Sig (${profiles[0].model})**\n${sigOut}`);
-
-          const slopOut = await generateResponse(
-            profiles[1],
-            `Debate round ${i + 1}. Respond to Sig and push a sharp counterpoint on: ${prompt}`,
-            context
-          );
-          await destination.send(`**Slop (${profiles[1].model})**\n${slopOut}`);
-        }
-        await destination.send(toolsFooter(contextResult.method));
-      } finally {
-        activeDebates.delete(debateKey);
-      }
-      return;
-    }
-
-    const output = await generateResponse(profile, prompt, context, { requireSources: !smalltalk });
+    const effectivePrompt =
+      maybeCommand?.command === "tldr"
+        ? `Give a concise TLDR on: ${prompt}. Stick to what the knowledge base says — key points, why it matters, and link to sources.`
+        : prompt;
+    const output = await generateResponse(profile, effectivePrompt, context, { requireSources: !smalltalk });
     await destination.send(modelBadge(profile.model));
     const parts = splitForDiscord(output);
     for (const part of parts) {
@@ -802,69 +772,35 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
     return;
   }
 
-  const command = interaction.commandName as "ask" | "search" | "episode" | "debate";
-  const query = interaction.options.getString("query", true).trim();
+  const command = interaction.commandName as "tldr" | "wassup";
   await interaction.deferReply();
 
-  if (command === "debate" && profile.name !== "Sig") {
-    await interaction.editReply("Debates are orchestrated by Sig.");
-    return;
-  }
-
-  const smalltalk = command === "ask" && isGreetingOrSmalltalk(query);
-  const contextResult = smalltalk
-    ? { method: "smalltalk", text: "No graph retrieval needed for greeting/smalltalk." }
-    : await queryKnowledgeBase(query);
-  const context = contextResult.text;
-
-  if (command === "search") {
-    const snippets = context.length > 1800 ? `${context.slice(0, 1800)}...` : context;
-    await interaction.editReply(
-      `${modelBadge(profile.model)}\n\nSearch context for "${query}":\n\n${snippets}\n\n${toolsFooter(contextResult.method)}`
-    );
-    return;
-  }
-
-  if (command === "episode") {
+  if (command === "wassup") {
+    const latest = await queryLatestContent(undefined, 6);
+    const context = latest?.text || "No recent content found.";
+    const contextMethod = latest?.method || "latest_node_lookup";
     const output = await generateResponse(
       profile,
-      `Find episode-level answers for: ${query}. Focus on episodes, guests, dates, and links.`,
+      "What's new in Latent Space? Summarize the most interesting recent content — what dropped, why it matters, and what builders should pay attention to.",
       context
     );
     await interaction.editReply(
-      `${modelBadge(profile.model)}\n\n${output}\n\n${toolsFooter(contextResult.method)}`.slice(0, 1900)
+      `${modelBadge(profile.model)}\n\n${output}\n\n${toolsFooter(contextMethod)}`.slice(0, 1900)
     );
     return;
   }
 
-  if (command === "debate") {
-    const rounds: string[] = [];
-    for (let i = 0; i < Math.min(MAX_DEBATE_EXCHANGES, 2); i++) {
-      const sig = await generateResponse(
-        profiles[0],
-        `Debate round ${i + 1}. Take a factual position on: ${query}`,
-        context
-      );
-      const slop = await generateResponse(
-        profiles[1],
-        `Debate round ${i + 1}. Counter Sig with a provocative take on: ${query}`,
-        context
-      );
-      rounds.push(`Sig: ${sig}\n\nSlop: ${slop}`);
-    }
-    await interaction.editReply(
-      `🤖 ${shortModelName(profiles[0].model)} + ${shortModelName(profiles[1].model)}\n\n${rounds.join("\n\n---\n\n")}\n\n${toolsFooter(contextResult.method)}`.slice(
-        0,
-        1900
-      )
-    );
-    return;
-  }
-
-    const output = await generateResponse(profile, query, context, { requireSources: !smalltalk });
-    await interaction.editReply(
-      `${modelBadge(profile.model)}\n\n${output}\n\n${toolsFooter(contextResult.method)}`.slice(0, 1900)
-    );
+  // /tldr
+  const query = interaction.options.getString("query", true).trim();
+  const contextResult = await queryKnowledgeBase(query);
+  const output = await generateResponse(
+    profile,
+    `Give a concise TLDR on: ${query}. Stick to what the knowledge base says — key points, why it matters, and link to sources.`,
+    contextResult.text
+  );
+  await interaction.editReply(
+    `${modelBadge(profile.model)}\n\n${output}\n\n${toolsFooter(contextResult.method)}`.slice(0, 1900)
+  );
 }
 
 async function registerSlashCommands(profile: BotProfile): Promise<void> {
@@ -874,18 +810,13 @@ async function registerSlashCommands(profile: BotProfile): Promise<void> {
   }
 
   const commands = [
-    new SlashCommandBuilder().setName("ask").setDescription("Ask the bot a KB-grounded question").addStringOption((opt) =>
-      opt.setName("query").setDescription("Question to ask").setRequired(true)
-    ),
-    new SlashCommandBuilder().setName("search").setDescription("Search KB context snippets").addStringOption((opt) =>
-      opt.setName("query").setDescription("Search query").setRequired(true)
-    ),
-    new SlashCommandBuilder().setName("episode").setDescription("Lookup episodes/guests").addStringOption((opt) =>
-      opt.setName("query").setDescription("Episode/guest lookup").setRequired(true)
-    ),
-    new SlashCommandBuilder().setName("debate").setDescription("Run Sig/Slop debate").addStringOption((opt) =>
-      opt.setName("query").setDescription("Debate topic").setRequired(true)
-    )
+    new SlashCommandBuilder()
+      .setName("tldr")
+      .setDescription("Get a concise TLDR on any topic from the Latent Space graph")
+      .addStringOption((opt) => opt.setName("query").setDescription("Topic to summarize").setRequired(true)),
+    new SlashCommandBuilder()
+      .setName("wassup")
+      .setDescription("See what's new and interesting in Latent Space")
   ].map((c) => c.toJSON());
 
   const rest = new REST({ version: "10" }).setToken(profile.token);
@@ -922,6 +853,14 @@ async function startBot(profile: BotProfile): Promise<void> {
 
 async function main(): Promise<void> {
   console.log("Starting Latent Space bots...");
+
+  if (!profiles.length) {
+    console.error("No bot profiles configured (all tokens missing). Exiting.");
+    process.exit(1);
+  }
+
+  console.log(`Active bots: ${profiles.map((p) => p.name).join(", ")}`);
+
   if (ALLOWED_CHANNEL_IDS.size) {
     console.log(`Allowed channels: ${[...ALLOWED_CHANNEL_IDS].join(", ")}`);
   } else {
