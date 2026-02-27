@@ -2,7 +2,7 @@ import "dotenv/config";
 import http from "node:http";
 import path from "node:path";
 import fs from "node:fs";
-import { createClient as createLibsqlClient, type Client as LibsqlClient } from "@libsql/client";
+import { createClient as createLibsqlClient } from "@libsql/client";
 import {
   ChannelType,
   Client,
@@ -16,43 +16,7 @@ import {
   type Interaction,
   type Message
 } from "discord.js";
-import { createLsHubServices as createLocalLsHubServices } from "./lsHubServicesFallback";
-
-function loadSharedServicesFactory(): {
-  createLsHubServices: (options: { db?: LibsqlClient; tursoUrl?: string; tursoToken?: string }) => {
-    queryKnowledgeContext: (
-      query: string,
-      options?: { limit?: number; openAiApiKey?: string }
-    ) => Promise<{ method: string; text: string }>;
-  };
-} {
-  const candidates = [
-    "latent-space-hub-mcp/services",
-    "./lsHubServicesFallback",
-    process.env.LSH_MCP_SERVICES_PATH?.trim() || "",
-    path.resolve(__dirname, "../../latent-space-hub/apps/mcp-server-standalone/services")
-  ].filter(Boolean);
-
-  for (const candidate of candidates) {
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      return require(candidate);
-    } catch {
-      // try next candidate
-    }
-  }
-
-  return {
-    createLsHubServices: (options) => {
-      if (!options.db) {
-        throw new Error("Local LS services fallback requires a db client.");
-      }
-      return createLocalLsHubServices({ db: options.db });
-    }
-  };
-}
-
-const { createLsHubServices } = loadSharedServicesFactory();
+import { McpGraphClient } from "./mcpGraphClient";
 
 type BotProfile = {
   name: "Slop";
@@ -110,7 +74,6 @@ function requiredEnv(name: string): string {
 const TURSO_DATABASE_URL = requiredEnv("TURSO_DATABASE_URL");
 const TURSO_AUTH_TOKEN = requiredEnv("TURSO_AUTH_TOKEN");
 const OPENROUTER_API_KEY = requiredEnv("OPENROUTER_API_KEY");
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
 const SLOP_MODEL = process.env.SLOP_MODEL || "anthropic/claude-sonnet-4-6";
 const DISCORD_TEST_GUILD_ID = process.env.DISCORD_TEST_GUILD_ID || "";
@@ -133,7 +96,27 @@ const db = createLibsqlClient({
   url: TURSO_DATABASE_URL,
   authToken: TURSO_AUTH_TOKEN
 });
-const lsHubServices = createLsHubServices({ db });
+const mcpGraph = new McpGraphClient();
+let cachedGuideSnippet = "";
+
+type MemberMetadata = {
+  discord_id: string;
+  discord_handle: string;
+  joined_at: string;
+  last_active?: string;
+  interaction_count?: number;
+  interests?: string[];
+  role?: string;
+  company?: string;
+  location?: string;
+};
+
+type MemberNode = {
+  id: number;
+  title: string;
+  notes: string;
+  metadata: MemberMetadata;
+};
 
 const profileSeeds: BotProfileSeed[] = [
   {
@@ -253,25 +236,192 @@ function withinRateLimit(
   return true;
 }
 
-async function queryKnowledgeBase(query: string, limit = MAX_CONTEXT_ROWS): Promise<{ method: string; text: string }> {
+function formatMemberContext(member: MemberNode): string {
+  const interests = (member.metadata.interests || []).slice(0, 8).join(", ") || "none yet";
+  const lastActive = member.metadata.last_active || member.metadata.joined_at || "unknown";
+  const recentNotes = member.notes
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(-3)
+    .join(" | ");
+  return (
+    `[MEMBER CONTEXT]\n` +
+    `Name: ${member.title}\n` +
+    `Interests: ${interests}\n` +
+    `Last active: ${lastActive}\n` +
+    `Recent interactions: ${recentNotes || "none"}\n` +
+    `Use this to personalize your response naturally.`
+  );
+}
+
+function summarizeUserMessage(message: string): string {
+  const clean = message.replace(/\s+/g, " ").trim();
+  if (clean.length <= 180) return clean;
+  return `${clean.slice(0, 177)}...`;
+}
+
+function extractInterestKeywords(message: string): string[] {
+  const stopwords = new Set([
+    "the",
+    "and",
+    "for",
+    "that",
+    "with",
+    "this",
+    "from",
+    "what",
+    "about",
+    "have",
+    "your",
+    "into",
+    "just",
+    "like",
+    "they",
+    "them",
+    "will",
+    "would",
+    "could",
+    "should",
+    "there",
+    "their",
+    "then",
+    "than",
+    "when",
+    "where",
+    "which",
+    "also",
+    "more",
+    "most",
+    "very",
+    "really",
+    "please"
+  ]);
+  const matches = message.toLowerCase().match(/[a-z0-9][a-z0-9-]{2,}/g) || [];
+  const filtered = matches.filter((token) => !stopwords.has(token));
+  return Array.from(new Set(filtered)).slice(0, 10);
+}
+
+function parseMetadata(raw: unknown): MemberMetadata {
+  if (!raw || typeof raw !== "object") {
+    return {
+      discord_id: "",
+      discord_handle: "",
+      joined_at: new Date().toISOString(),
+      interests: [],
+      interaction_count: 0
+    };
+  }
+
+  const data = raw as Record<string, unknown>;
+  return {
+    discord_id: String(data.discord_id || ""),
+    discord_handle: String(data.discord_handle || ""),
+    joined_at: String(data.joined_at || new Date().toISOString()),
+    last_active: data.last_active ? String(data.last_active) : undefined,
+    interaction_count: Number(data.interaction_count || 0),
+    interests: Array.isArray(data.interests) ? data.interests.map((x) => String(x)) : []
+  };
+}
+
+async function lookupMember(discordId: string): Promise<MemberNode | null> {
+  const row = await mcpGraph.lookupMemberByDiscordId(discordId);
+  if (!row) return null;
+  return {
+    id: row.id,
+    title: row.title,
+    notes: row.notes || "",
+    metadata: parseMetadata(row.metadata)
+  };
+}
+
+async function createMemberNodeFromUser(user: { id: string; username: string; globalName?: string | null }): Promise<{ id: number }> {
+  const now = new Date().toISOString();
+  const title = (user.globalName || user.username || "Discord Member").trim();
+  return mcpGraph.createMemberNode({
+    title,
+    description: `${title} — community member profile in Latent Space Discord.`,
+    metadata: {
+      discord_id: user.id,
+      discord_handle: user.username,
+      joined_at: now,
+      last_active: now,
+      interaction_count: 0,
+      interests: []
+    }
+  });
+}
+
+async function updateMemberAfterInteraction(
+  member: MemberNode,
+  userMessage: string,
+  retrievalNodeIds: number[]
+): Promise<void> {
+  const nowIso = new Date().toISOString();
+  const existingInterests = Array.isArray(member.metadata.interests) ? member.metadata.interests : [];
+  const mergedInterests = Array.from(new Set([...existingInterests, ...extractInterestKeywords(userMessage)])).slice(0, 25);
+  const metadata: MemberMetadata = {
+    ...member.metadata,
+    last_active: nowIso,
+    interaction_count: (member.metadata.interaction_count || 0) + 1,
+    interests: mergedInterests
+  };
+  const line = `[${nowIso.slice(0, 10)}] ${summarizeUserMessage(userMessage)}`;
+  await mcpGraph.updateMemberNode(member.id, {
+    content: line,
+    metadata: metadata as Record<string, unknown>
+  });
+
+  const uniqueTargets = Array.from(new Set(retrievalNodeIds.filter((id) => Number.isFinite(id) && id > 0 && id !== member.id))).slice(0, 8);
+  await Promise.all(
+    uniqueTargets.map(async (targetId) => {
+      try {
+        await mcpGraph.createMemberEdge(
+          member.id,
+          targetId,
+          "showed interest in this content during a Discord conversation"
+        );
+      } catch (error) {
+        console.warn(`Member edge create failed (${member.id} -> ${targetId}):`, error);
+      }
+    })
+  );
+}
+
+async function queryKnowledgeBase(
+  query: string,
+  limit = MAX_CONTEXT_ROWS
+): Promise<{ method: string; text: string; nodeIds: number[] }> {
   const intent = inferRetrievalIntent(query);
   if (intent.wantsLatest) {
     const latest = await queryLatestContent(intent.requestedType);
     if (latest) {
       return {
         method: latest.method,
-        text: latest.text
+        text: latest.text,
+        nodeIds: latest.nodeIds
       };
     }
   }
 
-  const result = await lsHubServices.queryKnowledgeContext(query, {
-    limit,
-    openAiApiKey: OPENAI_API_KEY || undefined
+  const results = await mcpGraph.searchContent(query, limit);
+  const nodeIds = Array.from(new Set(results.map((row) => row.node_id).filter((id) => Number.isFinite(id) && id > 0))).slice(0, 10);
+  const nodes = await mcpGraph.getNodes(nodeIds);
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
+  const lines = results.map((row, idx) => {
+    const node = nodeById.get(row.node_id);
+    const title = node?.title || row.title || "Untitled";
+    const link = node?.link || "";
+    const type = node?.node_type || "unknown";
+    const date = node?.event_date || "unknown-date";
+    const titleLine = link ? `[${title}](${link})` : title;
+    return `${idx + 1}. [${date}] (${type}) ${titleLine}\nExcerpt: ${row.text}\nLink: ${link}`;
   });
+
   return {
-    method: result.method || "unknown",
-    text: result.text || "No matching rows found in nodes/chunks tables."
+    method: "mcp:search_content",
+    text: lines.length ? `Search method: mcp_search_content\n\n${lines.join("\n\n")}` : "No matching rows found in nodes/chunks tables.",
+    nodeIds
   };
 }
 
@@ -296,33 +446,14 @@ function inferRetrievalIntent(query: string): RetrievalIntent {
 async function queryLatestContent(
   nodeType?: ContentNodeType,
   limit = 3
-): Promise<{ method: string; text: string } | null> {
-  const contentTypes: ContentNodeType[] = [
-    "podcast",
-    "article",
-    "ainews",
-    "builders-club",
-    "paper-club",
-    "workshop"
-  ];
-
-  const sql =
-    "SELECT id, title, node_type, event_date, coalesce(description, '') AS description, " +
-    "substr(coalesce(notes, ''), 1, 700) AS excerpt, coalesce(link, '') AS link " +
-    "FROM nodes " +
-    "WHERE event_date IS NOT NULL " +
-    (nodeType
-      ? "AND node_type = ? "
-      : `AND node_type IN (${contentTypes.map(() => "?").join(",")}) `) +
-    "ORDER BY event_date DESC, updated_at DESC " +
-    `LIMIT ${Math.max(1, Math.floor(limit))}`;
-
-  const args: string[] = nodeType ? [nodeType] : contentTypes;
-  const result = await db.execute({ sql, args });
-  const rows = result.rows || [];
+): Promise<{ method: string; text: string; nodeIds: number[] } | null> {
+  const rows = await mcpGraph.queryLatestContent(nodeType, limit);
   if (!rows.length) return null;
 
+  const nodeIds: number[] = [];
   const lines = rows.map((row, idx) => {
+    const id = Number(row.id);
+    if (Number.isFinite(id) && id > 0) nodeIds.push(id);
     const type = String(row.node_type || "unknown");
     const date = String(row.event_date || "unknown-date");
     const title = String(row.title || "Untitled");
@@ -338,7 +469,8 @@ async function queryLatestContent(
 
   return {
     method: nodeType ? `latest_node_lookup:${nodeType}` : "latest_node_lookup",
-    text: `Search method: latest_node_lookup\n\n${lines.join("\n\n")}`
+    text: `Search method: latest_node_lookup\n\n${lines.join("\n\n")}`,
+    nodeIds
   };
 }
 
@@ -363,6 +495,24 @@ function formatToolMethod(method: string): string {
 
 function toolsFooter(method: string): string {
   return `🛠️ ${formatToolMethod(method)}`;
+}
+
+async function loadGuideSnippet(): Promise<string> {
+  if (cachedGuideSnippet) return cachedGuideSnippet;
+  try {
+    const guide = await mcpGraph.readGuide("start-here");
+    const compact = guide
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(0, 14)
+      .join(" ");
+    cachedGuideSnippet = compact.slice(0, 900);
+  } catch (error) {
+    console.warn("Unable to load MCP guide context:", error);
+    cachedGuideSnippet = "";
+  }
+  return cachedGuideSnippet;
 }
 
 async function ensureDestinationChannel(message: Message, botName: string): Promise<DestinationChannel> {
@@ -407,9 +557,10 @@ async function generateResponse(
   profile: BotProfile,
   userPrompt: string,
   context: string,
-  options?: { requireSources?: boolean }
+  options?: { requireSources?: boolean; additionalSystemContext?: string }
 ): Promise<string> {
   const requireSources = options?.requireSources ?? true;
+  const additionalSystemContext = options?.additionalSystemContext?.trim() || "";
   const profileStyleLine =
     "Style: opinionated, sharp, slightly unhinged tone. Keep it concise but punchy. Still ground factual claims in provided context. IMPORTANT: When referencing specific content (episodes, articles, AINews), always include the direct link. Format: [Title](url). Never reference content without linking to it.";
   const groundingLine = requireSources
@@ -422,7 +573,7 @@ async function generateResponse(
     messages: [
       {
         role: "system",
-        content: `${profile.systemPrompt}\n\n${groundingLine}\n${profileStyleLine}`
+        content: `${profile.systemPrompt}\n\n${groundingLine}\n${profileStyleLine}${additionalSystemContext ? `\n\n${additionalSystemContext}` : ""}`
       },
       {
         role: "user",
@@ -704,6 +855,14 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   const prompt = maybeCommand?.query || cleanUserPrompt(message, botUserId);
   const destination = await ensureDestinationChannel(message, profile.name);
   await destination.sendTyping();
+  const guideSnippet = await loadGuideSnippet();
+  const member = await lookupMember(message.author.id);
+  const memberSystemContext = member
+    ? formatMemberContext(member)
+    : "[MEMBER STATUS] This user is not in the member graph yet. Casually mention `/join` when it naturally fits.";
+  const additionalSystemContext = [guideSnippet ? `[GUIDE CONTEXT]\n${guideSnippet}` : "", memberSystemContext]
+    .filter(Boolean)
+    .join("\n\n");
 
   // /wassup fetches its own context, skip general KB query
   if (maybeCommand?.command === "wassup") {
@@ -714,7 +873,8 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
       const output = await generateResponse(
         profile,
         "What's new in Latent Space? Summarize the most interesting recent content — what dropped, why it matters, and what builders should pay attention to.",
-        wassupContext
+        wassupContext,
+        { additionalSystemContext }
       );
       await destination.send(modelBadge(profile.model));
       const parts = splitForDiscord(output);
@@ -731,7 +891,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
 
   const smalltalk = !maybeCommand && isGreetingOrSmalltalk(prompt);
   const contextResult = smalltalk
-    ? { method: "smalltalk", text: "No graph retrieval needed for greeting/smalltalk." }
+    ? { method: "smalltalk", text: "No graph retrieval needed for greeting/smalltalk.", nodeIds: [] as number[] }
     : await queryKnowledgeBase(prompt);
   const context = contextResult.text;
   const contextMethodLine = `Search method: ${contextResult.method}`;
@@ -741,7 +901,10 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
       maybeCommand?.command === "tldr"
         ? `Give a concise TLDR on: ${prompt}. Stick to what the knowledge base says — key points, why it matters, and link to sources.`
         : prompt;
-    const output = await generateResponse(profile, effectivePrompt, context, { requireSources: !smalltalk });
+    const output = await generateResponse(profile, effectivePrompt, context, {
+      requireSources: !smalltalk,
+      additionalSystemContext
+    });
     await destination.send(modelBadge(profile.model));
     const parts = splitForDiscord(output);
     for (const part of parts) {
@@ -749,6 +912,15 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
     }
     await destination.send(toolsFooter(contextResult.method));
     await maybeLogChat(profile, message, prompt, output, contextMethodLine.replace("Search method: ", ""));
+    if (member) {
+      queueMicrotask(async () => {
+        try {
+          await updateMemberAfterInteraction(member, prompt, contextResult.nodeIds);
+        } catch (error) {
+          console.warn("Member update failed (non-blocking):", error);
+        }
+      });
+    }
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     await destination.send(`${profile.name} hit an error while generating a response: ${msg}`);
@@ -763,8 +935,42 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
     return;
   }
 
-  const command = interaction.commandName as "tldr" | "wassup";
+  const command = interaction.commandName as "tldr" | "wassup" | "join";
   await interaction.deferReply();
+
+  if (command === "join") {
+    try {
+      const existing = await lookupMember(interaction.user.id);
+      if (existing) {
+        await interaction.editReply(
+          `You're already in the graph. I've been tracking your interests since ${existing.metadata.joined_at}.`
+        );
+        return;
+      }
+
+      await createMemberNodeFromUser({
+        id: interaction.user.id,
+        username: interaction.user.username,
+        globalName: interaction.user.globalName
+      });
+      await interaction.editReply(
+        "You're in the graph. As we chat, I'll learn what you're into and connect you to relevant content."
+      );
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await interaction.editReply(`Couldn't add you to the graph right now: ${msg}`);
+    }
+    return;
+  }
+
+  const guideSnippet = await loadGuideSnippet();
+  const member = await lookupMember(interaction.user.id);
+  const memberSystemContext = member
+    ? formatMemberContext(member)
+    : "[MEMBER STATUS] This user is not in the member graph yet. Casually mention `/join` when it naturally fits.";
+  const additionalSystemContext = [guideSnippet ? `[GUIDE CONTEXT]\n${guideSnippet}` : "", memberSystemContext]
+    .filter(Boolean)
+    .join("\n\n");
 
   if (command === "wassup") {
     const latest = await queryLatestContent(undefined, 6);
@@ -773,7 +979,8 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
     const output = await generateResponse(
       profile,
       "What's new in Latent Space? Summarize the most interesting recent content — what dropped, why it matters, and what builders should pay attention to.",
-      context
+      context,
+      { additionalSystemContext }
     );
     await interaction.editReply(
       `${modelBadge(profile.model)}\n\n${output}\n\n${toolsFooter(contextMethod)}`.slice(0, 1900)
@@ -787,11 +994,21 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
   const output = await generateResponse(
     profile,
     `Give a concise TLDR on: ${query}. Stick to what the knowledge base says — key points, why it matters, and link to sources.`,
-    contextResult.text
+    contextResult.text,
+    { additionalSystemContext }
   );
   await interaction.editReply(
     `${modelBadge(profile.model)}\n\n${output}\n\n${toolsFooter(contextResult.method)}`.slice(0, 1900)
   );
+  if (member) {
+    queueMicrotask(async () => {
+      try {
+        await updateMemberAfterInteraction(member, query, contextResult.nodeIds);
+      } catch (error) {
+        console.warn("Member update failed (non-blocking):", error);
+      }
+    });
+  }
 }
 
 async function registerSlashCommands(profile: BotProfile): Promise<void> {
@@ -807,7 +1024,10 @@ async function registerSlashCommands(profile: BotProfile): Promise<void> {
       .addStringOption((opt) => opt.setName("query").setDescription("Topic to summarize").setRequired(true)),
     new SlashCommandBuilder()
       .setName("wassup")
-      .setDescription("See what's new and interesting in Latent Space")
+      .setDescription("See what's new and interesting in Latent Space"),
+    new SlashCommandBuilder()
+      .setName("join")
+      .setDescription("Add yourself to the Latent Space knowledge graph")
   ].map((c) => c.toJSON());
 
   const rest = new REST({ version: "10" }).setToken(profile.token);
@@ -857,6 +1077,8 @@ async function main(): Promise<void> {
   } else {
     console.warn("ALLOWED_CHANNEL_IDS not set. Bots will respond in any channel they can read.");
   }
+  await mcpGraph.connect();
+  await loadGuideSnippet();
   await Promise.all(profiles.map((profile) => startBot(profile)));
   startKickoffServer();
 }

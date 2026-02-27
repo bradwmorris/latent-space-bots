@@ -8,7 +8,8 @@ Gateway runtime implemented for:
 - Mention/reply handling with thread-first replies
 - Single-owner thread routing: if a user tags one bot, that bot owns the thread follow-up conversation
 - Slash commands: `/tldr`, `/wassup`
-- Hybrid retrieval via shared `latent-space-hub-mcp/services` layer (vector + FTS, with fallback)
+- Slash command: `/join` (member profile opt-in)
+- MCP-first graph access via `latent-space-hub-mcp` tools
 - Channel allowlist + basic rate limiting
 - Optional chat logging to Turso (`ENABLE_CHAT_LOG_WRITE=true`)
 - Kickoff API (`POST /internal/kickoff`) for announcement → Slop response without mention-trigger dependence
@@ -19,15 +20,16 @@ Gateway runtime implemented for:
 |---------|--------|-------------|
 | `/tldr` | `query` (required) | Get a concise TLDR on any topic from the Latent Space graph |
 | `/wassup` | none | See what's new and interesting in Latent Space |
+| `/join` | none | Add yourself as a member node in the Latent Space graph |
 
-## Shared LS services
+## MCP graph runtime
 
-Bots now consume the shared graph retrieval layer exported by `latent-space-hub-mcp/services`.
+Bots use the MCP server (`latent-space-hub-mcp`) for graph reads/writes.
 
-If your installed npm package version does not include that export yet, set:
+Optional override:
 
 ```bash
-LSH_MCP_SERVICES_PATH=/absolute/path/to/latent-space-hub/apps/mcp-server-standalone/services
+LS_HUB_MCP_SERVER_PATH=/absolute/path/to/latent-space-hub/apps/mcp-server-standalone/index.js
 ```
 
 ## Persona (`SOUL`) files
