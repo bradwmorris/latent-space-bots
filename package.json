@@ -10,7 +10,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "backfill:member-avatars": "tsx scripts/backfill-member-avatars.ts"
   },
   "dependencies": {
     "@libsql/client": "^0.17.0",

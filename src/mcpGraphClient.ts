@@ -204,11 +204,14 @@ export class McpGraphClient {
     return { id };
   }
 
-  async updateMemberNode(nodeId: number, updates: { content: string; metadata: Record<string, unknown> }): Promise<void> {
+  async updateMemberNode(
+    nodeId: number,
+    updates: { content?: string; metadata: Record<string, unknown> }
+  ): Promise<void> {
     await this.callTool("ls_update_node", {
       id: nodeId,
       updates: {
-        content: updates.content,
+        ...(updates.content ? { content: updates.content } : {}),
         metadata: updates.metadata
       }
     });

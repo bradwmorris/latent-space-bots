@@ -14,7 +14,8 @@ import {
   ThreadAutoArchiveDuration,
   type GuildTextBasedChannel,
   type Interaction,
-  type Message
+  type Message,
+  type User
 } from "discord.js";
 import { McpGraphClient, type ToolTrace } from "./mcpGraphClient";
 
@@ -102,6 +103,7 @@ let cachedMemberGuide = "";
 type MemberMetadata = {
   discord_id: string;
   discord_handle: string;
+  avatar_url?: string;
   joined_at: string;
   last_active?: string;
   interaction_count?: number;
@@ -283,10 +285,14 @@ function parseMetadata(raw: unknown): MemberMetadata {
   return {
     discord_id: String(data.discord_id || ""),
     discord_handle: String(data.discord_handle || ""),
+    avatar_url: data.avatar_url ? String(data.avatar_url) : undefined,
     joined_at: String(data.joined_at || new Date().toISOString()),
     last_active: data.last_active ? String(data.last_active) : undefined,
     interaction_count: Number(data.interaction_count || 0),
-    interests: Array.isArray(data.interests) ? data.interests.map((x) => String(x)) : []
+    interests: Array.isArray(data.interests) ? data.interests.map((x) => String(x)) : [],
+    role: data.role ? String(data.role) : undefined,
+    company: data.company ? String(data.company) : undefined,
+    location: data.location ? String(data.location) : undefined
   };
 }
 
@@ -301,7 +307,9 @@ async function lookupMember(discordId: string): Promise<MemberNode | null> {
   };
 }
 
-async function createMemberNodeFromUser(user: { id: string; username: string; globalName?: string | null }): Promise<{ id: number }> {
+async function createMemberNodeFromUser(
+  user: Pick<User, "id" | "username" | "globalName" | "displayAvatarURL">
+): Promise<{ id: number }> {
   const now = new Date().toISOString();
   const title = (user.globalName || user.username || "Discord Member").trim();
   return mcpGraph.createMemberNode({
@@ -310,6 +318,7 @@ async function createMemberNodeFromUser(user: { id: string; username: string; gl
     metadata: {
       discord_id: user.id,
       discord_handle: user.username,
+      avatar_url: user.displayAvatarURL({ size: 256, extension: "png" }),
       joined_at: now,
       last_active: now,
       interaction_count: 0,
@@ -336,12 +345,14 @@ async function updateMemberAfterInteraction(
   member: MemberNode,
   userMessage: string,
   retrievalNodeIds: number[],
-  profileUpdate?: { role?: string; company?: string; location?: string; interests?: string[] } | null
+  profileUpdate?: { role?: string; company?: string; location?: string; interests?: string[] } | null,
+  avatarUrl?: string
 ): Promise<void> {
   const nowIso = new Date().toISOString();
 
   const metadata: MemberMetadata = {
     ...member.metadata,
+    avatar_url: avatarUrl || member.metadata.avatar_url,
     last_active: nowIso,
     interaction_count: (member.metadata.interaction_count || 0) + 1
   };
@@ -967,7 +978,13 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
     if (member) {
       queueMicrotask(async () => {
         try {
-          await updateMemberAfterInteraction(member, prompt, contextResult.nodeIds, profileUpdate);
+          await updateMemberAfterInteraction(
+            member,
+            prompt,
+            contextResult.nodeIds,
+            profileUpdate,
+            message.author.displayAvatarURL({ size: 256, extension: "png" })
+          );
         } catch (error) {
           console.warn("Member update failed (non-blocking):", error);
         }
@@ -997,6 +1014,16 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
     try {
       const existing = await lookupMember(interaction.user.id);
       if (existing) {
+        const refreshedMetadata: MemberMetadata = {
+          ...existing.metadata,
+          discord_id: interaction.user.id,
+          discord_handle: interaction.user.username,
+          avatar_url: interaction.user.displayAvatarURL({ size: 256, extension: "png" }),
+          last_active: new Date().toISOString()
+        };
+        await mcpGraph.updateMemberNode(existing.id, {
+          metadata: refreshedMetadata as Record<string, unknown>
+        });
         const reply = `You're already in the graph. I've been tracking your interests since ${existing.metadata.joined_at}.`;
         await interaction.editReply(reply);
         await logTrace(profile, traceSource, "/join", reply, {
@@ -1006,11 +1033,7 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
         return;
       }
 
-      const newMember = await createMemberNodeFromUser({
-        id: interaction.user.id,
-        username: interaction.user.username,
-        globalName: interaction.user.globalName
-      });
+      const newMember = await createMemberNodeFromUser(interaction.user);
       const reply = "You're in the graph. As we chat, I'll learn what you're into and connect you to relevant content.";
       await interaction.editReply(reply);
       await logTrace(profile, traceSource, "/join", reply, {
@@ -1077,7 +1100,13 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
   if (member) {
     queueMicrotask(async () => {
       try {
-        await updateMemberAfterInteraction(member, query, contextResult.nodeIds);
+        await updateMemberAfterInteraction(
+          member,
+          query,
+          contextResult.nodeIds,
+          undefined,
+          interaction.user.displayAvatarURL({ size: 256, extension: "png" })
+        );
       } catch (error) {
         console.warn("Member update failed (non-blocking):", error);
       }
