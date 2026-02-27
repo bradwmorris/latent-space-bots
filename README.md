@@ -22,6 +22,15 @@ Gateway runtime implemented for:
 | `/wassup` | none | See what's new and interesting in Latent Space |
 | `/join` | none | Add yourself as a member node in the Latent Space graph |
 
+## Member Memory
+
+After a user runs `/join`:
+
+- Slop looks up member context before responding.
+- Responses are personalized using interests and recent interaction notes.
+- After each response, the bot appends a one-line interaction note, updates metadata (`last_active`, `interaction_count`, `interests`), and creates member → content edges for retrieved items.
+- Post-response graph writes are non-blocking (Slop still replies even if writes fail).
+
 ## MCP graph runtime
 
 Bots use the MCP server (`latent-space-hub-mcp`) for graph reads/writes.
