@@ -7,6 +7,14 @@ type McpToolResult = {
   isError?: boolean;
 };
 
+export type ToolTrace = {
+  tool: string;
+  args: Record<string, unknown>;
+  result: unknown;
+  duration_ms: number;
+  error?: string;
+};
+
 type McpNodeRow = {
   id: number;
   title: string;
@@ -24,6 +32,22 @@ function getMcpServerScriptPath(): string {
   return require.resolve("latent-space-hub-mcp/index.js");
 }
 
+function summarizeToolResult(result: McpToolResult): unknown {
+  if (result.structuredContent) {
+    const json = JSON.stringify(result.structuredContent);
+    if (json.length > 2000) {
+      const sc = result.structuredContent as Record<string, unknown>;
+      if (Array.isArray(sc.rows)) return { rows_count: sc.rows.length };
+      if (Array.isArray(sc.results)) return { results_count: sc.results.length };
+      if (Array.isArray(sc.nodes)) return { nodes_count: sc.nodes.length };
+      return { truncated: true, length: json.length };
+    }
+    return result.structuredContent;
+  }
+  const text = normalizeTextContent(result.content);
+  return text.length > 500 ? { text_preview: text.slice(0, 500), full_length: text.length } : { text };
+}
+
 function normalizeTextContent(content: McpToolResult["content"]): string {
   if (!Array.isArray(content)) return "";
   return content
@@ -36,6 +60,13 @@ function normalizeTextContent(content: McpToolResult["content"]): string {
 export class McpGraphClient {
   private client: McpClient | null = null;
   private connected = false;
+  public callTraces: ToolTrace[] = [];
+
+  clearTraces(): ToolTrace[] {
+    const traces = [...this.callTraces];
+    this.callTraces = [];
+    return traces;
+  }
 
   async connect(): Promise<void> {
     if (this.connected && this.client) return;
@@ -83,17 +114,24 @@ export class McpGraphClient {
   }
 
   async callTool(name: string, args: Record<string, unknown> = {}): Promise<McpToolResult> {
+    const start = Date.now();
     const client = this.ensureClient();
-    const result = (await client.callTool({
-      name,
-      arguments: args
-    })) as McpToolResult;
+    let result: McpToolResult;
+    try {
+      result = (await client.callTool({ name, arguments: args })) as McpToolResult;
+    } catch (error) {
+      this.callTraces.push({ tool: name, args, result: null, duration_ms: Date.now() - start, error: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
 
+    const elapsed = Date.now() - start;
     if (result?.isError) {
       const msg = normalizeTextContent(result.content) || `${name} returned an MCP error`;
+      this.callTraces.push({ tool: name, args, result: null, duration_ms: elapsed, error: msg });
       throw new Error(msg);
     }
 
+    this.callTraces.push({ tool: name, args, result: summarizeToolResult(result), duration_ms: elapsed });
     return result;
   }
 

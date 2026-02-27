@@ -16,7 +16,7 @@ import {
   type Interaction,
   type Message
 } from "discord.js";
-import { McpGraphClient } from "./mcpGraphClient";
+import { McpGraphClient, type ToolTrace } from "./mcpGraphClient";
 
 type BotProfile = {
   name: "Slop";
@@ -85,7 +85,6 @@ const ALLOWED_CHANNEL_IDS = new Set(
 );
 const USER_RATE_LIMIT_WINDOW_MS = Number(process.env.USER_RATE_LIMIT_WINDOW_MS || 5000);
 const CHANNEL_RATE_LIMIT_WINDOW_MS = Number(process.env.CHANNEL_RATE_LIMIT_WINDOW_MS || 1200);
-const ENABLE_CHAT_LOG_WRITE = String(process.env.ENABLE_CHAT_LOG_WRITE || "false").toLowerCase() === "true";
 const DEBATE_KICKOFF_SECRET = process.env.DEBATE_KICKOFF_SECRET || "";
 const DEBATE_KICKOFF_PORT = Number(process.env.DEBATE_KICKOFF_PORT || 8787);
 const DEBATE_KICKOFF_HOST = process.env.DEBATE_KICKOFF_HOST || "0.0.0.0";
@@ -607,33 +606,57 @@ async function generateResponse(
   return text;
 }
 
-async function maybeLogChat(
+type TraceOptions = {
+  retrieval_method: string;
+  context_node_ids: number[];
+  member_id: number | null;
+  is_slash_command: boolean;
+  slash_command: string | null;
+  is_kickoff: boolean;
+  latency_ms: number;
+};
+
+async function logTrace(
   profile: BotProfile,
-  message: Message,
+  source: { userId: string; username: string; channelId: string; messageId: string },
   prompt: string,
   response: string,
-  contextMethod: string
+  options: TraceOptions
 ): Promise<void> {
-  if (!ENABLE_CHAT_LOG_WRITE) return;
   try {
+    const toolCalls: ToolTrace[] = mcpGraph.clearTraces();
+    const metadata = {
+      discord_user_id: source.userId,
+      discord_username: source.username,
+      discord_channel_id: source.channelId,
+      discord_message_id: source.messageId,
+      retrieval_method: options.retrieval_method,
+      context_node_ids: options.context_node_ids,
+      tool_calls: toolCalls,
+      member_id: options.member_id,
+      model: profile.model,
+      is_slash_command: options.is_slash_command,
+      slash_command: options.slash_command,
+      is_kickoff: options.is_kickoff,
+      response_length: response.length,
+      latency_ms: options.latency_ms
+    };
+
     await db.execute({
-      sql:
-        "INSERT INTO chats " +
-        "(bot_name, user_id, channel_id, message_id, prompt, response, retrieval_method, created_at) " +
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      sql: "INSERT INTO chats (chat_type, user_message, assistant_message, thread_id, helper_name, agent_type, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       args: [
-        profile.name,
-        message.author.id,
-        message.channelId,
-        message.id,
+        "discord",
         prompt,
-        response.slice(0, 4000),
-        contextMethod,
+        response.slice(0, 8000),
+        source.channelId,
+        profile.name.toLowerCase(),
+        "discord-bot",
+        JSON.stringify(metadata),
         new Date().toISOString()
       ]
     });
-  } catch {
-    // Logging is best-effort only.
+  } catch (error) {
+    console.warn("Trace logging failed:", error instanceof Error ? error.message : String(error));
   }
 }
 
@@ -851,6 +874,10 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   if (!withinRateLimit(message, profile.name, { ownedThread })) return;
   processedMessageIds.add(dedupeKey);
 
+  mcpGraph.clearTraces();
+  const startTime = Date.now();
+  const traceSource = { userId: message.author.id, username: message.author.username, channelId: message.channelId, messageId: message.id };
+
   const maybeCommand = parseCommand(cleanUserPrompt(message, botUserId));
   const prompt = maybeCommand?.query || cleanUserPrompt(message, botUserId);
   const destination = await ensureDestinationChannel(message, profile.name);
@@ -882,6 +909,15 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
         await destination.send(part);
       }
       await destination.send(toolsFooter(wassupMethod));
+      await logTrace(profile, traceSource, prompt || "/wassup", output, {
+        retrieval_method: wassupMethod,
+        context_node_ids: latest?.nodeIds || [],
+        member_id: member?.id || null,
+        is_slash_command: false,
+        slash_command: "wassup",
+        is_kickoff: false,
+        latency_ms: Date.now() - startTime
+      });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       await destination.send(`${profile.name} hit an error while generating a response: ${msg}`);
@@ -894,7 +930,6 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
     ? { method: "smalltalk", text: "No graph retrieval needed for greeting/smalltalk.", nodeIds: [] as number[] }
     : await queryKnowledgeBase(prompt);
   const context = contextResult.text;
-  const contextMethodLine = `Search method: ${contextResult.method}`;
 
   try {
     const effectivePrompt =
@@ -911,7 +946,15 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
       await destination.send(part);
     }
     await destination.send(toolsFooter(contextResult.method));
-    await maybeLogChat(profile, message, prompt, output, contextMethodLine.replace("Search method: ", ""));
+    await logTrace(profile, traceSource, prompt, output, {
+      retrieval_method: contextResult.method,
+      context_node_ids: contextResult.nodeIds,
+      member_id: member?.id || null,
+      is_slash_command: !!maybeCommand,
+      slash_command: maybeCommand?.command || null,
+      is_kickoff: false,
+      latency_ms: Date.now() - startTime
+    });
     if (member) {
       queueMicrotask(async () => {
         try {
@@ -935,6 +978,9 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
     return;
   }
 
+  mcpGraph.clearTraces();
+  const startTime = Date.now();
+  const traceSource = { userId: interaction.user.id, username: interaction.user.username, channelId: interaction.channelId || "", messageId: interaction.id };
   const command = interaction.commandName as "tldr" | "wassup" | "join";
   await interaction.deferReply();
 
@@ -942,20 +988,26 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
     try {
       const existing = await lookupMember(interaction.user.id);
       if (existing) {
-        await interaction.editReply(
-          `You're already in the graph. I've been tracking your interests since ${existing.metadata.joined_at}.`
-        );
+        const reply = `You're already in the graph. I've been tracking your interests since ${existing.metadata.joined_at}.`;
+        await interaction.editReply(reply);
+        await logTrace(profile, traceSource, "/join", reply, {
+          retrieval_method: "member_lookup", context_node_ids: [], member_id: existing.id,
+          is_slash_command: true, slash_command: "join", is_kickoff: false, latency_ms: Date.now() - startTime
+        });
         return;
       }
 
-      await createMemberNodeFromUser({
+      const newMember = await createMemberNodeFromUser({
         id: interaction.user.id,
         username: interaction.user.username,
         globalName: interaction.user.globalName
       });
-      await interaction.editReply(
-        "You're in the graph. As we chat, I'll learn what you're into and connect you to relevant content."
-      );
+      const reply = "You're in the graph. As we chat, I'll learn what you're into and connect you to relevant content.";
+      await interaction.editReply(reply);
+      await logTrace(profile, traceSource, "/join", reply, {
+        retrieval_method: "member_create", context_node_ids: [], member_id: newMember.id,
+        is_slash_command: true, slash_command: "join", is_kickoff: false, latency_ms: Date.now() - startTime
+      });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       await interaction.editReply(`Couldn't add you to the graph right now: ${msg}`);
@@ -985,6 +1037,10 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
     await interaction.editReply(
       `${modelBadge(profile.model)}\n\n${output}\n\n${toolsFooter(contextMethod)}`.slice(0, 1900)
     );
+    await logTrace(profile, traceSource, "/wassup", output, {
+      retrieval_method: contextMethod, context_node_ids: latest?.nodeIds || [], member_id: member?.id || null,
+      is_slash_command: true, slash_command: "wassup", is_kickoff: false, latency_ms: Date.now() - startTime
+    });
     return;
   }
 
@@ -1000,6 +1056,10 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
   await interaction.editReply(
     `${modelBadge(profile.model)}\n\n${output}\n\n${toolsFooter(contextResult.method)}`.slice(0, 1900)
   );
+  await logTrace(profile, traceSource, `/tldr ${query}`, output, {
+    retrieval_method: contextResult.method, context_node_ids: contextResult.nodeIds, member_id: member?.id || null,
+    is_slash_command: true, slash_command: "tldr", is_kickoff: false, latency_ms: Date.now() - startTime
+  });
   if (member) {
     queueMicrotask(async () => {
       try {
