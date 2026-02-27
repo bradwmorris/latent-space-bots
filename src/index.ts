@@ -170,6 +170,17 @@ function getThreadOwnerBotName(message: Message): BotProfile["name"] | null {
   return null;
 }
 
+function isProfileUpdateThread(message: Message): boolean {
+  if (
+    message.channel.type !== ChannelType.PublicThread &&
+    message.channel.type !== ChannelType.PrivateThread
+  ) {
+    return false;
+  }
+  const threadName = (message.channel.name || "").trim().toLowerCase();
+  return threadName === "slop: profile update";
+}
+
 function shouldRespondToMessage(message: Message, botUserId: string, profileName: BotProfile["name"]): boolean {
   if (!message.inGuild()) return false;
 
@@ -901,6 +912,150 @@ function startKickoffServer(): void {
   });
 }
 
+async function handleProfileUpdateMessage(
+  profile: BotProfile,
+  message: Message,
+  traceSource: { userId: string; username: string; channelId: string; messageId: string },
+  startTime: number
+): Promise<void> {
+  const channel = message.channel as unknown as DestinationChannel;
+  await channel.sendTyping();
+
+  const member = await lookupMember(message.author.id);
+  if (!member) {
+    await channel.send("You're not in the graph yet. Run `/join` first.");
+    return;
+  }
+
+  // Fetch thread history for conversation context
+  const thread = message.channel;
+  let conversationHistory: Array<{ role: "user" | "assistant"; content: string }> = [];
+  if ("messages" in thread) {
+    const fetched = await (thread as { messages: { fetch: (opts: { limit: number }) => Promise<Map<string, Message>> } }).messages.fetch({ limit: 20 });
+    const sorted = Array.from(fetched.values()).sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+    conversationHistory = sorted
+      .filter((m) => !m.author.bot || m.author.id === message.client.user?.id)
+      .map((m) => ({
+        role: (m.author.bot ? "assistant" : "user") as "user" | "assistant",
+        content: m.content
+      }));
+  }
+
+  const userMessage = message.content.trim();
+
+  const currentProfile: string[] = [];
+  if (member.metadata.role) currentProfile.push(`Role: ${member.metadata.role}`);
+  if (member.metadata.company) currentProfile.push(`Company: ${member.metadata.company}`);
+  if (member.metadata.location) currentProfile.push(`Location: ${member.metadata.location}`);
+  if (member.metadata.interests?.length) currentProfile.push(`Interests: ${member.metadata.interests.join(", ")}`);
+
+  const systemPrompt = `You are Slop, running a profile update conversation for a Latent Space community member.
+
+Current profile for ${member.title}:
+${currentProfile.length ? currentProfile.join("\n") : "No info yet."}
+
+Your job: have a natural, short conversation to learn about this person. Ask about:
+- What they do (role, company)
+- Where they're based
+- What they're building or working on
+- What AI/tech topics they're most interested in
+
+Be conversational, not formal. One question at a time. Keep it punchy.
+If they've shared enough info across the conversation, wrap up with a summary of what you've captured and tell them their profile is updated.
+Keep responses under 200 words.`;
+
+  const messages: Array<{ role: string; content: string }> = [
+    { role: "system", content: systemPrompt },
+    ...conversationHistory
+  ];
+
+  // Generate conversational response
+  const payload = {
+    model: profile.model,
+    temperature: 0.7,
+    max_tokens: 400,
+    messages
+  };
+
+  const response = await fetch(OPENROUTER_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    await channel.send(`Hit an error: ${body.slice(0, 200)}`);
+    return;
+  }
+
+  const data = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const reply = data.choices?.[0]?.message?.content?.trim();
+  if (!reply) {
+    await channel.send("Something went wrong — got an empty response.");
+    return;
+  }
+
+  await channel.send(reply);
+
+  // Extract and save profile updates from the full conversation
+  queueMicrotask(async () => {
+    try {
+      const fullConversation = conversationHistory
+        .filter((m) => m.role === "user")
+        .map((m) => m.content)
+        .join("\n");
+
+      const extracted = await extractProfileFromUpdate(
+        fullConversation + "\n" + userMessage,
+        member.metadata
+      );
+
+      const updatedMetadata: MemberMetadata = {
+        ...member.metadata,
+        last_active: new Date().toISOString(),
+        interaction_count: (member.metadata.interaction_count || 0) + 1
+      };
+
+      let changed = false;
+      if (extracted.role) { updatedMetadata.role = extracted.role; changed = true; }
+      if (extracted.company) { updatedMetadata.company = extracted.company; changed = true; }
+      if (extracted.location) { updatedMetadata.location = extracted.location; changed = true; }
+      if (extracted.interests?.length) {
+        updatedMetadata.interests = Array.from(
+          new Set([...(member.metadata.interests || []), ...extracted.interests])
+        ).slice(0, 25);
+        changed = true;
+      }
+
+      if (changed) {
+        const line = `[${new Date().toISOString().slice(0, 10)}] Profile update via thread conversation`;
+        await mcpGraph.updateMemberNode(member.id, {
+          content: line,
+          metadata: updatedMetadata as Record<string, unknown>
+        });
+      }
+    } catch (error) {
+      console.warn("Profile update extraction failed (non-blocking):", error);
+    }
+  });
+
+  await logTrace(profile, traceSource, userMessage, reply, {
+    retrieval_method: "profile_update_thread",
+    context_node_ids: [],
+    member_id: member.id,
+    is_slash_command: false,
+    slash_command: null,
+    is_kickoff: false,
+    latency_ms: Date.now() - startTime
+  });
+}
+
 async function handleMessage(client: Client, profile: BotProfile, message: Message): Promise<void> {
   if (message.webhookId) {
     console.log(
@@ -924,6 +1079,12 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   mcpGraph.clearTraces();
   const startTime = Date.now();
   const traceSource = { userId: message.author.id, username: message.author.username, channelId: message.channelId, messageId: message.id };
+
+  // Handle profile update threads separately
+  if (isProfileUpdateThread(message)) {
+    await handleProfileUpdateMessage(profile, message, traceSource, startTime);
+    return;
+  }
 
   const maybeCommand = parseCommand(cleanUserPrompt(message, botUserId));
   const prompt = maybeCommand?.query || cleanUserPrompt(message, botUserId);
@@ -1039,47 +1200,39 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
         return;
       }
 
-      const info = interaction.options.getString("info", true).trim();
-      const extracted = await extractProfileFromUpdate(info, member.metadata);
+      await interaction.editReply("Starting a profile update thread — hop in.");
 
-      const updatedMetadata: MemberMetadata = {
-        ...member.metadata,
-        last_active: new Date().toISOString(),
-        interaction_count: (member.metadata.interaction_count || 0) + 1
-      };
-      if (extracted.role) updatedMetadata.role = extracted.role;
-      if (extracted.company) updatedMetadata.company = extracted.company;
-      if (extracted.location) updatedMetadata.location = extracted.location;
-      if (extracted.interests?.length) {
-        updatedMetadata.interests = Array.from(
-          new Set([...(member.metadata.interests || []), ...extracted.interests])
-        ).slice(0, 25);
+      const channel = interaction.channel;
+      if (!channel || !("threads" in channel)) {
+        await interaction.editReply("Can't create threads in this channel.");
+        return;
       }
 
-      const line = `[${new Date().toISOString().slice(0, 10)}] Profile update: ${info.slice(0, 120)}`;
-      await mcpGraph.updateMemberNode(member.id, {
-        content: line,
-        metadata: updatedMetadata as Record<string, unknown>
+      const thread = await (channel as unknown as { threads: { create: (opts: { name: string; autoArchiveDuration: number; reason: string }) => Promise<DestinationChannel & { send: (content: string) => Promise<unknown> }> } }).threads.create({
+        name: `Slop: profile update`,
+        autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+        reason: `Profile update for ${interaction.user.username}`
       });
 
-      const parts: string[] = [];
-      if (extracted.role) parts.push(`**Role:** ${extracted.role}`);
-      if (extracted.company) parts.push(`**Company:** ${extracted.company}`);
-      if (extracted.location) parts.push(`**Location:** ${extracted.location}`);
-      if (extracted.interests?.length) parts.push(`**Interests:** ${extracted.interests.join(", ")}`);
+      const currentProfile: string[] = [];
+      if (member.metadata.role) currentProfile.push(`**Role:** ${member.metadata.role}`);
+      if (member.metadata.company) currentProfile.push(`**Company:** ${member.metadata.company}`);
+      if (member.metadata.location) currentProfile.push(`**Location:** ${member.metadata.location}`);
+      if (member.metadata.interests?.length) currentProfile.push(`**Interests:** ${member.metadata.interests.join(", ")}`);
 
-      const reply = parts.length
-        ? `Profile updated.\n${parts.join("\n")}`
-        : "Got it — but I couldn't extract any structured info from that. Try something like: `/update I'm an ML engineer at Google, based in SF, interested in agents and RAG`";
+      const opener = currentProfile.length
+        ? `Here's what I've got on you so far:\n${currentProfile.join("\n")}\n\nWhat do you want to update? Tell me about yourself — what you do, where you're based, what you're building, what topics you nerd out on. I'll update your profile as we go.`
+        : `I don't have much on you yet. Tell me about yourself — what do you do? Where are you based? What are you building or interested in? I'll update your profile as we go.`;
 
-      await interaction.editReply(reply);
-      await logTrace(profile, traceSource, `/update ${info}`, reply, {
-        retrieval_method: "member_update", context_node_ids: [], member_id: member.id,
+      await thread.send(opener);
+
+      await logTrace(profile, traceSource, "/update", opener, {
+        retrieval_method: "member_update_thread", context_node_ids: [], member_id: member.id,
         is_slash_command: true, slash_command: "update", is_kickoff: false, latency_ms: Date.now() - startTime
       });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      await interaction.editReply(`Couldn't update your profile: ${msg}`);
+      await interaction.editReply(`Couldn't start profile update: ${msg}`);
     }
     return;
   }
@@ -1190,8 +1343,7 @@ async function registerSlashCommands(profile: BotProfile): Promise<void> {
       .setDescription("Add yourself to the Latent Space knowledge graph"),
     new SlashCommandBuilder()
       .setName("update")
-      .setDescription("Update your profile in the knowledge graph")
-      .addStringOption((opt) => opt.setName("info").setDescription("Tell me about yourself — role, company, location, interests").setRequired(true))
+      .setDescription("Update your profile — starts a conversation to learn about you")
   ].map((c) => c.toJSON());
 
   const rest = new REST({ version: "10" }).setToken(profile.token);
