@@ -257,7 +257,7 @@ function formatMemberContext(member: MemberNode): string {
   return (
     `[MEMBER CONTEXT]\n` +
     profileLines.join("\n") + "\n" +
-    `Use this to personalize your response naturally. If they share personal info (role, company, location, what they're building), acknowledge it — it gets saved automatically.`
+    `Use this to personalize your response naturally.`
   );
 }
 
@@ -318,68 +318,27 @@ async function createMemberNodeFromUser(user: { id: string; username: string; gl
   });
 }
 
-async function extractProfileFields(
-  userMessage: string,
-  currentMetadata: MemberMetadata
-): Promise<{ role?: string; company?: string; location?: string; interests?: string[] }> {
-  const payload = {
-    model: "anthropic/claude-3.5-haiku",
-    temperature: 0,
-    max_tokens: 300,
-    messages: [
-      {
-        role: "system" as const,
-        content: `Extract structured profile info from a Discord user's message. Return ONLY valid JSON with these optional fields:
-- "role": their job title or role (e.g. "ML engineer", "founder", "student")
-- "company": company or org they work at
-- "location": city/country
-- "interests": array of specific technical topic keywords (e.g. ["agents", "rag", "local-first-ai", "mcp"])
-
-Rules:
-- Only include fields the user ACTUALLY mentioned or clearly implied about THEMSELVES.
-- For interests: extract specific technical/domain topics only. Not generic words like "stuff", "things", "cool".
-- If the message is just a question about content (e.g. "what's the latest podcast?") with no personal info, return {}.
-- If interests overlap with existing ones, don't duplicate them.
-
-Current profile interests: ${JSON.stringify(currentMetadata.interests || [])}
-Return ONLY the JSON object, no markdown fences, no explanation.`
-      },
-      { role: "user" as const, content: userMessage }
-    ]
-  };
-
+function parseProfileBlock(response: string): {
+  clean: string;
+  profile: { role?: string; company?: string; location?: string; interests?: string[] } | null;
+} {
+  const match = response.match(/<profile>\s*(\{[\s\S]*?\})\s*<\/profile>/);
+  if (!match) return { clean: response, profile: null };
+  const clean = response.replace(/<profile>[\s\S]*?<\/profile>/, "").trim();
   try {
-    const response = await fetch(OPENROUTER_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(payload)
-    });
-
-    if (!response.ok) return {};
-
-    const data = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-    const text = data.choices?.[0]?.message?.content?.trim() || "{}";
-    const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
-    return JSON.parse(cleaned);
+    return { clean, profile: JSON.parse(match[1]) };
   } catch {
-    return {};
+    return { clean, profile: null };
   }
 }
 
 async function updateMemberAfterInteraction(
   member: MemberNode,
   userMessage: string,
-  retrievalNodeIds: number[]
+  retrievalNodeIds: number[],
+  profileUpdate?: { role?: string; company?: string; location?: string; interests?: string[] } | null
 ): Promise<void> {
   const nowIso = new Date().toISOString();
-
-  // Use LLM to extract structured profile fields from the message
-  const extracted = await extractProfileFields(userMessage, member.metadata);
 
   const metadata: MemberMetadata = {
     ...member.metadata,
@@ -387,14 +346,16 @@ async function updateMemberAfterInteraction(
     interaction_count: (member.metadata.interaction_count || 0) + 1
   };
 
-  // Apply any extracted profile fields
-  if (extracted.role) metadata.role = extracted.role;
-  if (extracted.company) metadata.company = extracted.company;
-  if (extracted.location) metadata.location = extracted.location;
-  if (extracted.interests?.length) {
-    metadata.interests = Array.from(
-      new Set([...(member.metadata.interests || []), ...extracted.interests])
-    ).slice(0, 25);
+  // Apply profile fields extracted by the main model
+  if (profileUpdate) {
+    if (profileUpdate.role) metadata.role = profileUpdate.role;
+    if (profileUpdate.company) metadata.company = profileUpdate.company;
+    if (profileUpdate.location) metadata.location = profileUpdate.location;
+    if (profileUpdate.interests?.length) {
+      metadata.interests = Array.from(
+        new Set([...(member.metadata.interests || []), ...profileUpdate.interests])
+      ).slice(0, 25);
+    }
   }
 
   const line = `[${nowIso.slice(0, 10)}] ${summarizeUserMessage(userMessage)}`;
@@ -983,10 +944,11 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
       maybeCommand?.command === "tldr"
         ? `Give a concise TLDR on: ${prompt}. Stick to what the knowledge base says — key points, why it matters, and link to sources.`
         : prompt;
-    const output = await generateResponse(profile, effectivePrompt, context, {
+    const rawOutput = await generateResponse(profile, effectivePrompt, context, {
       requireSources: !smalltalk,
       additionalSystemContext
     });
+    const { clean: output, profile: profileUpdate } = parseProfileBlock(rawOutput);
     await destination.send(modelBadge(profile.model));
     const parts = splitForDiscord(output);
     for (const part of parts) {
@@ -1005,7 +967,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
     if (member) {
       queueMicrotask(async () => {
         try {
-          await updateMemberAfterInteraction(member, prompt, contextResult.nodeIds);
+          await updateMemberAfterInteraction(member, prompt, contextResult.nodeIds, profileUpdate);
         } catch (error) {
           console.warn("Member update failed (non-blocking):", error);
         }
