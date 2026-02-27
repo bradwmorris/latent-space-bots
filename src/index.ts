@@ -262,42 +262,44 @@ function summarizeUserMessage(message: string): string {
 
 function extractInterestKeywords(message: string): string[] {
   const stopwords = new Set([
-    "the",
-    "and",
-    "for",
-    "that",
-    "with",
-    "this",
-    "from",
-    "what",
-    "about",
-    "have",
-    "your",
-    "into",
-    "just",
-    "like",
-    "they",
-    "them",
-    "will",
-    "would",
-    "could",
-    "should",
-    "there",
-    "their",
-    "then",
-    "than",
-    "when",
-    "where",
-    "which",
-    "also",
-    "more",
-    "most",
-    "very",
-    "really",
-    "please"
+    // articles, prepositions, conjunctions
+    "the", "and", "for", "that", "with", "this", "from", "what", "about",
+    "into", "just", "like", "also", "more", "most", "very", "really", "please",
+    "there", "their", "then", "than", "when", "where", "which", "some", "such",
+    "over", "under", "after", "before", "between", "through", "during", "without",
+    "within", "along", "among", "around", "above", "below", "behind", "beyond",
+    // pronouns
+    "you", "your", "yours", "they", "them", "their", "theirs",
+    "she", "her", "hers", "him", "his", "its", "our", "ours",
+    "who", "whom", "whose", "myself", "yourself", "itself",
+    // common verbs (non-technical)
+    "have", "has", "had", "will", "would", "could", "should", "might",
+    "can", "may", "shall", "must", "need", "want", "know", "think",
+    "see", "look", "find", "get", "got", "give", "take", "make", "made",
+    "say", "said", "tell", "told", "ask", "asked", "let", "put", "try",
+    "come", "came", "going", "went", "been", "being", "does", "did",
+    "doing", "done", "was", "were", "are", "isn", "aren", "don", "didn",
+    "won", "wouldn", "couldn", "shouldn", "hasn", "haven", "wasn", "weren",
+    "keep", "kept", "set", "run", "show", "shown", "call", "called",
+    "help", "use", "used", "using", "work", "working", "start", "stop",
+    // conversational fillers
+    "hey", "hello", "thanks", "thank", "sorry", "yeah", "yep", "nope",
+    "okay", "sure", "right", "well", "hmm", "umm", "actually", "basically",
+    "literally", "maybe", "probably", "definitely", "obviously", "apparently",
+    "pretty", "quite", "still", "already", "anyway", "though", "although",
+    // question / request words
+    "how", "why", "any", "all", "each", "every", "both", "few", "many",
+    "much", "own", "other", "another", "same", "different", "new", "old",
+    "first", "last", "next", "only", "even", "ever", "never", "always",
+    // bot-interaction noise
+    "bot", "slop", "check", "update", "record", "information", "access",
+    "search", "graph", "tool", "tools", "latest", "recent", "now",
+    "thing", "things", "stuff", "something", "anything", "nothing",
+    "way", "ways", "lot", "lots", "bit", "kind", "type", "part",
+    "able", "seem", "seems", "feel", "feels", "looking", "interested"
   ]);
-  const matches = message.toLowerCase().match(/[a-z0-9][a-z0-9-]{2,}/g) || [];
-  const filtered = matches.filter((token) => !stopwords.has(token));
+  const matches = message.toLowerCase().match(/[a-z][a-z0-9-]{2,}/g) || [];
+  const filtered = matches.filter((token) => !stopwords.has(token) && token.length > 3);
   return Array.from(new Set(filtered)).slice(0, 10);
 }
 
@@ -349,6 +351,51 @@ async function createMemberNodeFromUser(user: { id: string; username: string; gl
       interests: []
     }
   });
+}
+
+async function extractProfileFromUpdate(
+  userMessage: string,
+  currentMetadata: MemberMetadata
+): Promise<{ role?: string; company?: string; location?: string; interests?: string[] }> {
+  const payload = {
+    model: "anthropic/claude-haiku-3.5",
+    temperature: 0,
+    max_tokens: 300,
+    messages: [
+      {
+        role: "system" as const,
+        content: `Extract structured profile info from the user's message. Return ONLY valid JSON with these optional fields:
+- "role": their job title or role (e.g. "ML engineer", "founder", "student")
+- "company": company or org they work at
+- "location": city/country
+- "interests": array of topic keywords (e.g. ["agents", "rag", "local-first-ai", "mcp"])
+
+Only include fields the user actually mentioned. For interests, extract specific technical topics — not generic words.
+Current profile interests: ${JSON.stringify(currentMetadata.interests || [])}
+Merge new interests with existing ones and deduplicate.
+Return ONLY the JSON object, no markdown fences, no explanation.`
+      },
+      { role: "user" as const, content: userMessage }
+    ]
+  };
+
+  const response = await fetch(OPENROUTER_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) throw new Error(`OpenRouter error: ${response.status}`);
+
+  const data = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const text = data.choices?.[0]?.message?.content?.trim() || "{}";
+  const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+  return JSON.parse(cleaned);
 }
 
 async function updateMemberAfterInteraction(
@@ -981,8 +1028,61 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
   mcpGraph.clearTraces();
   const startTime = Date.now();
   const traceSource = { userId: interaction.user.id, username: interaction.user.username, channelId: interaction.channelId || "", messageId: interaction.id };
-  const command = interaction.commandName as "tldr" | "wassup" | "join";
+  const command = interaction.commandName as "tldr" | "wassup" | "join" | "update";
   await interaction.deferReply();
+
+  if (command === "update") {
+    try {
+      const member = await lookupMember(interaction.user.id);
+      if (!member) {
+        await interaction.editReply("You're not in the graph yet. Run `/join` first, then come back and `/update` your profile.");
+        return;
+      }
+
+      const info = interaction.options.getString("info", true).trim();
+      const extracted = await extractProfileFromUpdate(info, member.metadata);
+
+      const updatedMetadata: MemberMetadata = {
+        ...member.metadata,
+        last_active: new Date().toISOString(),
+        interaction_count: (member.metadata.interaction_count || 0) + 1
+      };
+      if (extracted.role) updatedMetadata.role = extracted.role;
+      if (extracted.company) updatedMetadata.company = extracted.company;
+      if (extracted.location) updatedMetadata.location = extracted.location;
+      if (extracted.interests?.length) {
+        updatedMetadata.interests = Array.from(
+          new Set([...(member.metadata.interests || []), ...extracted.interests])
+        ).slice(0, 25);
+      }
+
+      const line = `[${new Date().toISOString().slice(0, 10)}] Profile update: ${info.slice(0, 120)}`;
+      await mcpGraph.updateMemberNode(member.id, {
+        content: line,
+        metadata: updatedMetadata as Record<string, unknown>
+      });
+
+      const parts: string[] = [];
+      if (extracted.role) parts.push(`**Role:** ${extracted.role}`);
+      if (extracted.company) parts.push(`**Company:** ${extracted.company}`);
+      if (extracted.location) parts.push(`**Location:** ${extracted.location}`);
+      if (extracted.interests?.length) parts.push(`**Interests:** ${extracted.interests.join(", ")}`);
+
+      const reply = parts.length
+        ? `Profile updated.\n${parts.join("\n")}`
+        : "Got it — but I couldn't extract any structured info from that. Try something like: `/update I'm an ML engineer at Google, based in SF, interested in agents and RAG`";
+
+      await interaction.editReply(reply);
+      await logTrace(profile, traceSource, `/update ${info}`, reply, {
+        retrieval_method: "member_update", context_node_ids: [], member_id: member.id,
+        is_slash_command: true, slash_command: "update", is_kickoff: false, latency_ms: Date.now() - startTime
+      });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await interaction.editReply(`Couldn't update your profile: ${msg}`);
+    }
+    return;
+  }
 
   if (command === "join") {
     try {
@@ -1087,7 +1187,11 @@ async function registerSlashCommands(profile: BotProfile): Promise<void> {
       .setDescription("See what's new and interesting in Latent Space"),
     new SlashCommandBuilder()
       .setName("join")
-      .setDescription("Add yourself to the Latent Space knowledge graph")
+      .setDescription("Add yourself to the Latent Space knowledge graph"),
+    new SlashCommandBuilder()
+      .setName("update")
+      .setDescription("Update your profile in the knowledge graph")
+      .addStringOption((opt) => opt.setName("info").setDescription("Tell me about yourself — role, company, location, interests").setRequired(true))
   ].map((c) => c.toJSON());
 
   const rest = new REST({ version: "10" }).setToken(profile.token);
