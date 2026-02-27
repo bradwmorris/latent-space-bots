@@ -97,6 +97,7 @@ const db = createLibsqlClient({
 });
 const mcpGraph = new McpGraphClient();
 let cachedGuideSnippet = "";
+let cachedMemberGuide = "";
 
 type MemberMetadata = {
   discord_id: string;
@@ -545,6 +546,16 @@ async function loadGuideSnippet(): Promise<string> {
   return cachedGuideSnippet;
 }
 
+function loadMemberGuide(): string {
+  if (cachedMemberGuide) return cachedMemberGuide;
+  try {
+    cachedMemberGuide = fs.readFileSync(path.join(__dirname, "..", "guides", "member-profiles.md"), "utf-8");
+  } catch {
+    cachedMemberGuide = "";
+  }
+  return cachedMemberGuide;
+}
+
 async function ensureDestinationChannel(message: Message, botName: string): Promise<DestinationChannel> {
   if (message.channel.type === ChannelType.PublicThread || message.channel.type === ChannelType.PrivateThread) {
     return message.channel as unknown as DestinationChannel;
@@ -914,11 +925,16 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   const destination = await ensureDestinationChannel(message, profile.name);
   await destination.sendTyping();
   const guideSnippet = await loadGuideSnippet();
+  const memberGuide = loadMemberGuide();
   const member = await lookupMember(message.author.id);
   const memberSystemContext = member
     ? formatMemberContext(member)
     : "[MEMBER STATUS] This user is not in the member graph yet. Casually mention `/join` when it naturally fits.";
-  const additionalSystemContext = [guideSnippet ? `[GUIDE CONTEXT]\n${guideSnippet}` : "", memberSystemContext]
+  const additionalSystemContext = [
+    guideSnippet ? `[GUIDE CONTEXT]\n${guideSnippet}` : "",
+    memberGuide ? `[MEMBER GUIDE]\n${memberGuide}` : "",
+    memberSystemContext
+  ]
     .filter(Boolean)
     .join("\n\n");
 
@@ -1047,11 +1063,16 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
   }
 
   const guideSnippet = await loadGuideSnippet();
+  const memberGuide = loadMemberGuide();
   const member = await lookupMember(interaction.user.id);
   const memberSystemContext = member
     ? formatMemberContext(member)
     : "[MEMBER STATUS] This user is not in the member graph yet. Casually mention `/join` when it naturally fits.";
-  const additionalSystemContext = [guideSnippet ? `[GUIDE CONTEXT]\n${guideSnippet}` : "", memberSystemContext]
+  const additionalSystemContext = [
+    guideSnippet ? `[GUIDE CONTEXT]\n${guideSnippet}` : "",
+    memberGuide ? `[MEMBER GUIDE]\n${memberGuide}` : "",
+    memberSystemContext
+  ]
     .filter(Boolean)
     .join("\n\n");
 
