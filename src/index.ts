@@ -323,7 +323,7 @@ async function extractProfileFields(
   currentMetadata: MemberMetadata
 ): Promise<{ role?: string; company?: string; location?: string; interests?: string[] }> {
   const payload = {
-    model: "anthropic/claude-haiku-3.5",
+    model: "anthropic/claude-3.5-haiku",
     temperature: 0,
     max_tokens: 300,
     messages: [
