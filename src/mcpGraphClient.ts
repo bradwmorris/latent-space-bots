@@ -15,6 +15,11 @@ export type ToolTrace = {
   error?: string;
 };
 
+export type OpenAIToolDef = {
+  type: "function";
+  function: { name: string; description?: string; parameters?: unknown };
+};
+
 type McpNodeRow = {
   id: number;
   title: string;
@@ -48,7 +53,7 @@ function summarizeToolResult(result: McpToolResult): unknown {
   return text.length > 500 ? { text_preview: text.slice(0, 500), full_length: text.length } : { text };
 }
 
-function normalizeTextContent(content: McpToolResult["content"]): string {
+export function normalizeTextContent(content: McpToolResult["content"]): string {
   if (!Array.isArray(content)) return "";
   return content
     .filter((c) => c?.type === "text" && typeof c.text === "string")
@@ -57,15 +62,45 @@ function normalizeTextContent(content: McpToolResult["content"]): string {
     .join("\n\n");
 }
 
+const READ_ONLY_TOOLS = new Set([
+  "ls_get_context",
+  "ls_search_nodes",
+  "ls_get_nodes",
+  "ls_query_edges",
+  "ls_list_dimensions",
+  "ls_search_content",
+  "ls_sqlite_query",
+  "ls_list_guides",
+  "ls_read_guide"
+]);
+
 export class McpGraphClient {
   private client: McpClient | null = null;
   private connected = false;
+  private cachedToolDefs: OpenAIToolDef[] | null = null;
   public callTraces: ToolTrace[] = [];
 
   clearTraces(): ToolTrace[] {
     const traces = [...this.callTraces];
     this.callTraces = [];
     return traces;
+  }
+
+  async getToolDefinitions(): Promise<OpenAIToolDef[]> {
+    if (this.cachedToolDefs) return this.cachedToolDefs;
+    const client = this.ensureClient();
+    const { tools } = await client.listTools();
+    this.cachedToolDefs = tools
+      .filter((t) => READ_ONLY_TOOLS.has(t.name))
+      .map((t) => ({
+        type: "function" as const,
+        function: {
+          name: t.name,
+          description: t.description,
+          parameters: t.inputSchema
+        }
+      }));
+    return this.cachedToolDefs;
   }
 
   async connect(): Promise<void> {

@@ -17,7 +17,7 @@ import {
   type Message,
   type User
 } from "discord.js";
-import { McpGraphClient, type ToolTrace } from "./mcpGraphClient";
+import { McpGraphClient, normalizeTextContent, type ToolTrace } from "./mcpGraphClient";
 
 type BotProfile = {
   name: "Slop";
@@ -52,13 +52,8 @@ type KickoffPayload = {
 };
 
 type ContentNodeType = "podcast" | "article" | "ainews" | "builders-club" | "paper-club" | "workshop";
-type RetrievalIntent = {
-  wantsLatest: boolean;
-  requestedType?: ContentNodeType;
-};
 
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
-const MAX_CONTEXT_ROWS = 6;
 const processedMessageIds = new Set<string>();
 const rateLimitByUser = new Map<string, number>();
 const rateLimitByChannel = new Map<string, number>();
@@ -391,106 +386,6 @@ async function updateMemberAfterInteraction(
   );
 }
 
-async function queryKnowledgeBase(
-  query: string,
-  limit = MAX_CONTEXT_ROWS
-): Promise<{ method: string; text: string; nodeIds: number[] }> {
-  const intent = inferRetrievalIntent(query);
-  if (intent.wantsLatest) {
-    const latest = await queryLatestContent(intent.requestedType);
-    if (latest) {
-      return {
-        method: latest.method,
-        text: latest.text,
-        nodeIds: latest.nodeIds
-      };
-    }
-  }
-
-  // Run both searches in parallel: nodes (by title/description) AND chunks (by content)
-  const [nodeResults, chunkResults] = await Promise.all([
-    mcpGraph.searchNodes(query, limit).catch(() => []),
-    mcpGraph.searchContent(query, limit).catch(() => [])
-  ]);
-
-  // Merge node IDs from both sources (nodes first, then chunks)
-  const seenIds = new Set<number>();
-  const allNodeIds: number[] = [];
-  for (const n of nodeResults) {
-    if (Number.isFinite(n.id) && n.id > 0 && !seenIds.has(n.id)) {
-      seenIds.add(n.id);
-      allNodeIds.push(n.id);
-    }
-  }
-  for (const r of chunkResults) {
-    if (Number.isFinite(r.node_id) && r.node_id > 0 && !seenIds.has(r.node_id)) {
-      seenIds.add(r.node_id);
-      allNodeIds.push(r.node_id);
-    }
-  }
-  const nodeIds = allNodeIds.slice(0, 10);
-
-  // Fetch full node details for all found IDs
-  const nodes = await mcpGraph.getNodes(nodeIds);
-  const nodeById = new Map(nodes.map((n) => [n.id, n]));
-
-  // Build context lines: node results first (with description), then chunk excerpts
-  const lines: string[] = [];
-  let idx = 0;
-
-  // Node-level results (matched by title/description — works even without chunks)
-  for (const nr of nodeResults) {
-    const node = nodeById.get(nr.id) || nr;
-    const title = node.title || "Untitled";
-    const link = node.link || "";
-    const type = node.node_type || "unknown";
-    const date = node.event_date || "unknown-date";
-    const titleLine = link ? `[${title}](${link})` : title;
-    const desc = node.description || "";
-    lines.push(`${++idx}. [${date}] (${type}) ${titleLine}\nDescription: ${desc}\nLink: ${link}`);
-  }
-
-  // Chunk-level results (matched by transcript/article content)
-  for (const row of chunkResults) {
-    if (seenIds.has(row.node_id) && nodeResults.some((n) => n.id === row.node_id)) continue; // already shown via node result
-    const node = nodeById.get(row.node_id);
-    const title = node?.title || row.title || "Untitled";
-    const link = node?.link || "";
-    const type = node?.node_type || "unknown";
-    const date = node?.event_date || "unknown-date";
-    const titleLine = link ? `[${title}](${link})` : title;
-    lines.push(`${++idx}. [${date}] (${type}) ${titleLine}\nExcerpt: ${row.text}\nLink: ${link}`);
-  }
-
-  const method = nodeResults.length > 0 && chunkResults.length > 0
-    ? "hybrid:nodes+chunks"
-    : nodeResults.length > 0 ? "mcp:search_nodes" : "mcp:search_content";
-
-  return {
-    method,
-    text: lines.length ? `Search method: ${method}\n\n${lines.join("\n\n")}` : "No matching rows found in nodes/chunks tables.",
-    nodeIds
-  };
-}
-
-function inferRetrievalIntent(query: string): RetrievalIntent {
-  const text = query.toLowerCase();
-  const wantsLatest = /\b(latest|most recent|newest|just dropped|recently published)\b/.test(text);
-
-  if (!wantsLatest) {
-    return { wantsLatest: false };
-  }
-
-  if (/\b(podcast|episode)\b/.test(text)) return { wantsLatest: true, requestedType: "podcast" };
-  if (/\b(article|blog|substack)\b/.test(text)) return { wantsLatest: true, requestedType: "article" };
-  if (/\b(ai\s*news|ainews|newsletter)\b/.test(text)) return { wantsLatest: true, requestedType: "ainews" };
-  if (/\b(builders?\s*club|meetup)\b/.test(text)) return { wantsLatest: true, requestedType: "builders-club" };
-  if (/\b(paper\s*club)\b/.test(text)) return { wantsLatest: true, requestedType: "paper-club" };
-  if (/\b(workshop)\b/.test(text)) return { wantsLatest: true, requestedType: "workshop" };
-
-  return { wantsLatest: true };
-}
-
 async function queryLatestContent(
   nodeType?: ContentNodeType,
   limit = 3
@@ -665,6 +560,174 @@ async function generateResponse(
   return text;
 }
 
+type AgenticResult = { text: string; toolsUsed: string[] };
+
+type OpenRouterToolCall = {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+};
+
+type OpenRouterMessage = {
+  role: "system" | "user" | "assistant" | "tool";
+  content?: string | null;
+  tool_calls?: OpenRouterToolCall[];
+  tool_call_id?: string;
+};
+
+const MAX_AGENTIC_ROUNDS = 5;
+const MAX_TOOL_RESULT_CHARS = 4000;
+
+async function generateAgenticResponse(
+  profile: BotProfile,
+  userPrompt: string,
+  options?: { additionalSystemContext?: string }
+): Promise<AgenticResult> {
+  const additionalSystemContext = options?.additionalSystemContext?.trim() || "";
+  const tools = await mcpGraph.getToolDefinitions();
+
+  const profileStyleLine =
+    "Style: opinionated, sharp, slightly unhinged tone. Keep it concise but punchy. Still ground factual claims in tool results. IMPORTANT: When referencing specific content (episodes, articles, AINews), always include the direct link. Format: [Title](url). Never reference content without linking to it.";
+  const groundingLine =
+    "Use your tools to search the knowledge base BEFORE answering factual questions. Include a short 'Sources' list with direct links in your final response. Never fabricate content — if tools return nothing relevant, say so.";
+
+  const messages: OpenRouterMessage[] = [
+    {
+      role: "system",
+      content: `${profile.systemPrompt}\n\n${groundingLine}\n${profileStyleLine}${additionalSystemContext ? `\n\n${additionalSystemContext}` : ""}`
+    },
+    { role: "user", content: userPrompt }
+  ];
+
+  const toolsUsed: string[] = [];
+
+  for (let round = 0; round < MAX_AGENTIC_ROUNDS; round++) {
+    const payload = {
+      model: profile.model,
+      temperature: 0.6,
+      max_tokens: 1200,
+      messages,
+      tools
+    };
+
+    const response = await fetch(OPENROUTER_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`OpenRouter error (${response.status}): ${body.slice(0, 400)}`);
+    }
+
+    const data = (await response.json()) as {
+      choices?: Array<{
+        message?: {
+          content?: string | null;
+          tool_calls?: OpenRouterToolCall[];
+          role?: string;
+        };
+        finish_reason?: string;
+      }>;
+    };
+
+    const choice = data.choices?.[0];
+    const assistantMsg = choice?.message;
+    if (!assistantMsg) throw new Error("OpenRouter returned empty response.");
+
+    // Append the assistant message to conversation
+    const aMsg: OpenRouterMessage = { role: "assistant" };
+    if (assistantMsg.content) aMsg.content = assistantMsg.content;
+    if (assistantMsg.tool_calls?.length) aMsg.tool_calls = assistantMsg.tool_calls;
+    messages.push(aMsg);
+
+    // If no tool calls, we have our final text response
+    if (!assistantMsg.tool_calls?.length) {
+      const text = (assistantMsg.content || "").trim();
+      if (!text) throw new Error("OpenRouter returned empty response after tool loop.");
+      return { text, toolsUsed };
+    }
+
+    // Execute each tool call
+    for (const tc of assistantMsg.tool_calls) {
+      const toolName = tc.function.name;
+      toolsUsed.push(toolName);
+      let resultText: string;
+      try {
+        const args = JSON.parse(tc.function.arguments || "{}");
+        const result = await mcpGraph.callTool(toolName, args);
+        if (result.structuredContent) {
+          resultText = JSON.stringify(result.structuredContent);
+        } else {
+          resultText = normalizeTextContent(result.content);
+        }
+        if (resultText.length > MAX_TOOL_RESULT_CHARS) {
+          resultText = resultText.slice(0, MAX_TOOL_RESULT_CHARS) + "\n...[truncated]";
+        }
+      } catch (error) {
+        resultText = `Error: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      messages.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: resultText
+      });
+    }
+  }
+
+  // Exhausted rounds — force a text response without tools
+  messages.push({
+    role: "user",
+    content: "Please provide your final answer now based on the information gathered."
+  });
+
+  const finalPayload = {
+    model: profile.model,
+    temperature: 0.6,
+    max_tokens: 1200,
+    messages
+  };
+
+  const finalResponse = await fetch(OPENROUTER_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(finalPayload)
+  });
+
+  if (!finalResponse.ok) {
+    const body = await finalResponse.text();
+    throw new Error(`OpenRouter error (${finalResponse.status}): ${body.slice(0, 400)}`);
+  }
+
+  const finalData = (await finalResponse.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const text = finalData.choices?.[0]?.message?.content?.trim();
+  if (!text) throw new Error("OpenRouter returned empty response on final round.");
+  return { text, toolsUsed };
+}
+
+function agenticToolsFooter(toolsUsed: string[]): string {
+  if (!toolsUsed.length) return "🛠️ none";
+  const counts = new Map<string, number>();
+  for (const name of toolsUsed) {
+    const short = name.replace(/^ls_/, "");
+    counts.set(short, (counts.get(short) || 0) + 1);
+  }
+  const parts: string[] = [];
+  for (const [name, count] of counts) {
+    parts.push(count > 1 ? `${name}(x${count})` : name);
+  }
+  return `🛠️ ${parts.join(" | ")}`;
+}
+
 type TraceOptions = {
   retrieval_method: string;
   context_node_ids: number[];
@@ -804,9 +867,6 @@ async function runDeterministicKickoff(payload: KickoffPayload): Promise<{ ok: t
   const slopClient = getReadyClient("Slop");
 
   const destination = await resolveKickoffDestination(slopClient, payload);
-  const query = buildKickoffQuery(payload);
-  const contextResult = await queryKnowledgeBase(query);
-  const context = contextResult.text;
   const kickoffKey = `kickoff:${payload.channelId || BOT_TALK_CHANNEL_ID || "unknown"}`;
 
   if (activeDebates.has(kickoffKey)) {
@@ -817,19 +877,19 @@ async function runDeterministicKickoff(payload: KickoffPayload): Promise<{ ok: t
   try {
     const slopPrompt = [
       "New content just dropped in Latent Space. Break it down.",
-      `Context query: ${query}`,
+      `Context query: ${buildKickoffQuery(payload)}`,
       payload.title ? `Title: ${payload.title}` : "",
       payload.contentType ? `Type: ${payload.contentType}` : "",
       payload.eventDate ? `Date: ${payload.eventDate}` : "",
       payload.url ? `URL: ${payload.url}` : "",
-      "Summarize what's new, why it matters, and give your take. Cite sources."
+      "Search the knowledge base for this content, summarize what's new, why it matters, and give your take. Cite sources."
     ]
       .filter(Boolean)
       .join("\n");
 
-    const output = await generateResponse(slopProfile, slopPrompt, context);
+    const { text: output, toolsUsed } = await generateAgenticResponse(slopProfile, slopPrompt);
     await destination.send(`${modelBadge(slopProfile.model)}\n${output}`);
-    await destination.send(toolsFooter(contextResult.method));
+    await destination.send(agenticToolsFooter(toolsUsed));
   } finally {
     activeDebates.delete(kickoffKey);
   }
@@ -990,30 +1050,72 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   }
 
   const smalltalk = !maybeCommand && isGreetingOrSmalltalk(prompt);
-  const contextResult = smalltalk
-    ? { method: "smalltalk", text: "No graph retrieval needed for greeting/smalltalk.", nodeIds: [] as number[] }
-    : await queryKnowledgeBase(prompt);
-  const context = contextResult.text;
 
+  if (smalltalk) {
+    try {
+      const rawOutput = await generateResponse(profile, prompt, "No graph retrieval needed for greeting/smalltalk.", {
+        requireSources: false,
+        additionalSystemContext
+      });
+      const { clean: output, profile: profileUpdate } = parseProfileBlock(rawOutput);
+      await destination.send(modelBadge(profile.model));
+      const parts = splitForDiscord(output);
+      for (const part of parts) {
+        await destination.send(part);
+      }
+      await destination.send(agenticToolsFooter([]));
+      await logTrace(profile, traceSource, prompt, output, {
+        retrieval_method: "smalltalk",
+        context_node_ids: [],
+        member_id: member?.id || null,
+        is_slash_command: false,
+        slash_command: null,
+        is_kickoff: false,
+        latency_ms: Date.now() - startTime
+      });
+      if (member && profileUpdate) {
+        queueMicrotask(async () => {
+          try {
+            await updateMemberAfterInteraction(member, prompt, [], profileUpdate, message.author.displayAvatarURL({ size: 256, extension: "png" }));
+          } catch (error) {
+            console.warn("Member update failed (non-blocking):", error);
+          }
+        });
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await destination.send(`${profile.name} hit an error while generating a response: ${msg}`);
+    }
+    return;
+  }
+
+  // Agentic path — LLM decides what to search
   try {
     const effectivePrompt =
       maybeCommand?.command === "tldr"
         ? `Give a concise TLDR on: ${prompt}. Stick to what the knowledge base says — key points, why it matters, and link to sources.`
         : prompt;
-    const rawOutput = await generateResponse(profile, effectivePrompt, context, {
-      requireSources: !smalltalk,
-      additionalSystemContext
-    });
+    const { text: rawOutput, toolsUsed } = await generateAgenticResponse(profile, effectivePrompt, { additionalSystemContext });
     const { clean: output, profile: profileUpdate } = parseProfileBlock(rawOutput);
+    // Extract node IDs from tool call traces for member edge creation
+    const nodeIds = mcpGraph.callTraces
+      .filter((t) => t.tool === "ls_get_nodes" || t.tool === "ls_search_nodes")
+      .flatMap((t) => {
+        const r = t.result as Record<string, unknown> | null;
+        if (!r) return [];
+        if (Array.isArray(r)) return r.map((n: Record<string, unknown>) => Number(n.id)).filter(Number.isFinite);
+        if (typeof r === "object" && "nodes_count" in r) return [];
+        return [];
+      });
     await destination.send(modelBadge(profile.model));
     const parts = splitForDiscord(output);
     for (const part of parts) {
       await destination.send(part);
     }
-    await destination.send(toolsFooter(contextResult.method));
+    await destination.send(agenticToolsFooter(toolsUsed));
     await logTrace(profile, traceSource, prompt, output, {
-      retrieval_method: contextResult.method,
-      context_node_ids: contextResult.nodeIds,
+      retrieval_method: "agentic",
+      context_node_ids: nodeIds,
       member_id: member?.id || null,
       is_slash_command: !!maybeCommand,
       slash_command: maybeCommand?.command || null,
@@ -1026,7 +1128,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
           await updateMemberAfterInteraction(
             member,
             prompt,
-            contextResult.nodeIds,
+            nodeIds,
             profileUpdate,
             message.author.displayAvatarURL({ size: 256, extension: "png" })
           );
@@ -1126,20 +1228,26 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
     return;
   }
 
-  // /tldr
+  // /tldr — agentic path
   const query = interaction.options.getString("query", true).trim();
-  const contextResult = await queryKnowledgeBase(query);
-  const output = await generateResponse(
+  const { text: output, toolsUsed } = await generateAgenticResponse(
     profile,
     `Give a concise TLDR on: ${query}. Stick to what the knowledge base says — key points, why it matters, and link to sources.`,
-    contextResult.text,
     { additionalSystemContext }
   );
   await interaction.editReply(
-    `${modelBadge(profile.model)}\n\n${output}\n\n${toolsFooter(contextResult.method)}`.slice(0, 1900)
+    `${modelBadge(profile.model)}\n\n${output}\n\n${agenticToolsFooter(toolsUsed)}`.slice(0, 1900)
   );
+  const nodeIds = mcpGraph.callTraces
+    .filter((t) => t.tool === "ls_get_nodes" || t.tool === "ls_search_nodes")
+    .flatMap((t) => {
+      const r = t.result as Record<string, unknown> | null;
+      if (!r) return [];
+      if (Array.isArray(r)) return r.map((n: Record<string, unknown>) => Number(n.id)).filter(Number.isFinite);
+      return [];
+    });
   await logTrace(profile, traceSource, `/tldr ${query}`, output, {
-    retrieval_method: contextResult.method, context_node_ids: contextResult.nodeIds, member_id: member?.id || null,
+    retrieval_method: "agentic", context_node_ids: nodeIds, member_id: member?.id || null,
     is_slash_command: true, slash_command: "tldr", is_kickoff: false, latency_ms: Date.now() - startTime
   });
   if (member) {
@@ -1148,7 +1256,7 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
         await updateMemberAfterInteraction(
           member,
           query,
-          contextResult.nodeIds,
+          nodeIds,
           undefined,
           interaction.user.displayAvatarURL({ size: 256, extension: "png" })
         );
@@ -1226,6 +1334,8 @@ async function main(): Promise<void> {
     console.warn("ALLOWED_CHANNEL_IDS not set. Bots will respond in any channel they can read.");
   }
   await mcpGraph.connect();
+  const toolDefs = await mcpGraph.getToolDefinitions();
+  console.log(`MCP tools cached: ${toolDefs.length} read-only tools available for LLM`);
   await loadGuideSnippet();
   await Promise.all(profiles.map((profile) => startBot(profile)));
   startKickoffServer();
