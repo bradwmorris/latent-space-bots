@@ -407,23 +407,68 @@ async function queryKnowledgeBase(
     }
   }
 
-  const results = await mcpGraph.searchContent(query, limit);
-  const nodeIds = Array.from(new Set(results.map((row) => row.node_id).filter((id) => Number.isFinite(id) && id > 0))).slice(0, 10);
+  // Run both searches in parallel: nodes (by title/description) AND chunks (by content)
+  const [nodeResults, chunkResults] = await Promise.all([
+    mcpGraph.searchNodes(query, limit).catch(() => []),
+    mcpGraph.searchContent(query, limit).catch(() => [])
+  ]);
+
+  // Merge node IDs from both sources (nodes first, then chunks)
+  const seenIds = new Set<number>();
+  const allNodeIds: number[] = [];
+  for (const n of nodeResults) {
+    if (Number.isFinite(n.id) && n.id > 0 && !seenIds.has(n.id)) {
+      seenIds.add(n.id);
+      allNodeIds.push(n.id);
+    }
+  }
+  for (const r of chunkResults) {
+    if (Number.isFinite(r.node_id) && r.node_id > 0 && !seenIds.has(r.node_id)) {
+      seenIds.add(r.node_id);
+      allNodeIds.push(r.node_id);
+    }
+  }
+  const nodeIds = allNodeIds.slice(0, 10);
+
+  // Fetch full node details for all found IDs
   const nodes = await mcpGraph.getNodes(nodeIds);
   const nodeById = new Map(nodes.map((n) => [n.id, n]));
-  const lines = results.map((row, idx) => {
+
+  // Build context lines: node results first (with description), then chunk excerpts
+  const lines: string[] = [];
+  let idx = 0;
+
+  // Node-level results (matched by title/description — works even without chunks)
+  for (const nr of nodeResults) {
+    const node = nodeById.get(nr.id) || nr;
+    const title = node.title || "Untitled";
+    const link = node.link || "";
+    const type = node.node_type || "unknown";
+    const date = node.event_date || "unknown-date";
+    const titleLine = link ? `[${title}](${link})` : title;
+    const desc = node.description || "";
+    lines.push(`${++idx}. [${date}] (${type}) ${titleLine}\nDescription: ${desc}\nLink: ${link}`);
+  }
+
+  // Chunk-level results (matched by transcript/article content)
+  for (const row of chunkResults) {
+    if (seenIds.has(row.node_id) && nodeResults.some((n) => n.id === row.node_id)) continue; // already shown via node result
     const node = nodeById.get(row.node_id);
     const title = node?.title || row.title || "Untitled";
     const link = node?.link || "";
     const type = node?.node_type || "unknown";
     const date = node?.event_date || "unknown-date";
     const titleLine = link ? `[${title}](${link})` : title;
-    return `${idx + 1}. [${date}] (${type}) ${titleLine}\nExcerpt: ${row.text}\nLink: ${link}`;
-  });
+    lines.push(`${++idx}. [${date}] (${type}) ${titleLine}\nExcerpt: ${row.text}\nLink: ${link}`);
+  }
+
+  const method = nodeResults.length > 0 && chunkResults.length > 0
+    ? "hybrid:nodes+chunks"
+    : nodeResults.length > 0 ? "mcp:search_nodes" : "mcp:search_content";
 
   return {
-    method: "mcp:search_content",
-    text: lines.length ? `Search method: mcp_search_content\n\n${lines.join("\n\n")}` : "No matching rows found in nodes/chunks tables.",
+    method,
+    text: lines.length ? `Search method: ${method}\n\n${lines.join("\n\n")}` : "No matching rows found in nodes/chunks tables.",
     nodeIds
   };
 }

@@ -225,6 +225,27 @@ export class McpGraphClient {
     });
   }
 
+  async searchNodes(query: string, limit: number): Promise<McpNodeRow[]> {
+    const result = await this.callTool("ls_search_nodes", {
+      query,
+      limit
+    });
+    const nodes = ((result.structuredContent as { nodes?: unknown[] } | undefined)?.nodes || []) as Array<
+      Record<string, unknown>
+    >;
+
+    return nodes.map((row) => ({
+      id: Number(row.id),
+      title: String(row.title || ""),
+      notes: row.notes == null ? null : String(row.notes),
+      description: row.description == null ? null : String(row.description),
+      link: row.link == null ? null : String(row.link),
+      node_type: row.node_type == null ? null : String(row.node_type),
+      event_date: row.event_date == null ? null : String(row.event_date),
+      metadata: row.metadata
+    }));
+  }
+
   async searchContent(query: string, limit: number): Promise<Array<{ node_id: number; title: string; text: string }>> {
     const result = await this.callTool("ls_search_content", {
       query,
