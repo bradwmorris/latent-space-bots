@@ -463,22 +463,21 @@ function toolsFooter(method: string): string {
   return `🛠️ ${formatToolMethod(method)}`;
 }
 
-type SkillFrontmatter = {
+type SkillMeta = {
   name: string;
   description: string;
   when_to_use: string;
-  body: string;
 };
 
 const SKILLS_DIR = path.join(__dirname, "..", "skills");
 
-function loadSkillFiles(): SkillFrontmatter[] {
+function loadSkillIndex(): SkillMeta[] {
   if (!fs.existsSync(SKILLS_DIR)) return [];
   return fs.readdirSync(SKILLS_DIR)
     .filter((f) => f.endsWith(".md"))
     .map((f) => {
       const raw = fs.readFileSync(path.join(SKILLS_DIR, f), "utf-8");
-      const fmMatch = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+      const fmMatch = raw.match(/^---\n([\s\S]*?)\n---/);
       if (!fmMatch) return null;
       const fm: Record<string, string> = {};
       for (const line of fmMatch[1].split("\n")) {
@@ -493,28 +492,35 @@ function loadSkillFiles(): SkillFrontmatter[] {
         name: fm.name || f.replace(".md", ""),
         description: fm.description || "",
         when_to_use: fm.when_to_use || "",
-        body: fmMatch[2].trim(),
       };
     })
-    .filter((s): s is SkillFrontmatter => s !== null);
+    .filter((s): s is SkillMeta => s !== null);
+}
+
+function readLocalSkill(name: string): string | null {
+  const slug = name.toLowerCase().replace(/[^a-z0-9-]/g, "-");
+  const filepath = path.join(SKILLS_DIR, `${slug}.md`);
+  if (!fs.existsSync(filepath)) return null;
+  const raw = fs.readFileSync(filepath, "utf-8");
+  const bodyMatch = raw.match(/^---\n[\s\S]*?\n---\n([\s\S]*)$/);
+  return bodyMatch ? bodyMatch[1].trim() : raw;
 }
 
 let cachedSkillsContext = "";
 
 function loadSkillsContext(): string {
   if (cachedSkillsContext) return cachedSkillsContext;
-  const skills = loadSkillFiles();
+  const skills = loadSkillIndex();
   if (!skills.length) return "";
 
-  const index = skills
-    .map((s) => `- **${s.name}**: ${s.description}${s.when_to_use ? ` — ${s.when_to_use}` : ""}`)
+  const lines = skills
+    .map((s) => `- **${s.name}**: ${s.description}${s.when_to_use ? ` | When: ${s.when_to_use}` : ""}`)
     .join("\n");
 
-  const bodies = skills
-    .map((s) => `### ${s.name}\n${s.body}`)
-    .join("\n\n");
-
-  cachedSkillsContext = `[SKILLS]\n${index}\n\n${bodies}`;
+  cachedSkillsContext = [
+    "[SKILLS] You have the following operational skills. Read the full skill with ls_read_skill(name) when you need detailed instructions.",
+    lines,
+  ].join("\n");
   return cachedSkillsContext;
 }
 
@@ -709,11 +715,25 @@ async function generateAgenticResponse(
       let resultText: string;
       try {
         const args = JSON.parse(tc.function.arguments || "{}");
-        const result = await mcpGraph.callTool(toolName, args);
-        if (result.structuredContent) {
-          resultText = JSON.stringify(result.structuredContent);
+
+        // Serve local bot skills first, fall back to MCP
+        if (toolName === "ls_read_skill" && typeof args.name === "string") {
+          const local = readLocalSkill(args.name);
+          if (local) {
+            resultText = local;
+          } else {
+            const result = await mcpGraph.callTool(toolName, args);
+            resultText = result.structuredContent
+              ? JSON.stringify(result.structuredContent)
+              : normalizeTextContent(result.content);
+          }
         } else {
-          resultText = normalizeTextContent(result.content);
+          const result = await mcpGraph.callTool(toolName, args);
+          if (result.structuredContent) {
+            resultText = JSON.stringify(result.structuredContent);
+          } else {
+            resultText = normalizeTextContent(result.content);
+          }
         }
         if (resultText.length > MAX_TOOL_RESULT_CHARS) {
           resultText = resultText.slice(0, MAX_TOOL_RESULT_CHARS) + "\n...[truncated]";
