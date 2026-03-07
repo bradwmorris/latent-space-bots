@@ -10,7 +10,7 @@ ${profile.systemPrompt}\n\n${groundingLine}\n${profileStyleLine}\n\n${additional
 
 ## Part 1: Soul (`personas/slop.soul.md`)
 
-The full persona file. ~3,200 chars.
+The full persona file. ~6,500 chars.
 
 ```
 # SOUL: Slop
@@ -110,12 +110,12 @@ These 9 read-only tools are passed as the `tools` parameter alongside messages. 
 
 | Section | Chars |
 |---------|-------|
-| Soul file | ~3,200 |
+| Soul file | ~6,500 |
 | Grounding line | ~220 |
 | Style line | ~300 |
 | Skills index | ~727 |
 | Member context | ~300 |
-| **Total** | **~4,750** |
+| **Total** | **~8,050** |
 
 ---
 
