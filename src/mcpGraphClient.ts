@@ -252,6 +252,44 @@ export class McpGraphClient {
     });
   }
 
+  async createEventNode(payload: {
+    title: string;
+    description?: string;
+    event_date: string;
+    event_type: "paper-club" | "builders-club";
+    presenter_name: string;
+    presenter_discord_id?: string;
+    presenter_node_id?: number;
+    paper_url?: string;
+    paper_title?: string;
+    topic?: string;
+  }): Promise<{ id: number }> {
+    const result = await this.callTool("ls_add_node", {
+      title: payload.title,
+      description: payload.description,
+      dimensions: ["event", payload.event_type],
+      node_type: "event",
+      event_date: payload.event_date,
+      metadata: {
+        event_status: "scheduled",
+        event_type: payload.event_type,
+        presenter_name: payload.presenter_name,
+        presenter_discord_id: payload.presenter_discord_id,
+        presenter_node_id: payload.presenter_node_id,
+        paper_url: payload.paper_url,
+        paper_title: payload.paper_title,
+        topic: payload.topic,
+        scheduled_at: new Date().toISOString(),
+      }
+    });
+    const structured = result.structuredContent as { nodeId?: unknown } | undefined;
+    const id = Number(structured?.nodeId);
+    if (!Number.isFinite(id) || id <= 0) {
+      throw new Error("MCP ls_add_node did not return a valid nodeId for event.");
+    }
+    return { id };
+  }
+
   async createMemberEdge(sourceId: number, targetId: number, explanation: string): Promise<void> {
     await this.callTool("ls_create_edge", {
       sourceId,

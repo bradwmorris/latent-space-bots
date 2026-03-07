@@ -1173,7 +1173,7 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
   mcpGraph.clearTraces();
   const startTime = Date.now();
   const traceSource = { userId: interaction.user.id, username: interaction.user.username, channelId: interaction.channelId || "", messageId: interaction.id };
-  const command = interaction.commandName as "tldr" | "wassup" | "join";
+  const command = interaction.commandName as "tldr" | "wassup" | "join" | "paper-club" | "builders-club";
   await interaction.deferReply();
 
   if (command === "join") {
@@ -1209,6 +1209,79 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       await interaction.editReply(`Couldn't add you to the graph right now: ${msg}`);
+    }
+    return;
+  }
+
+  if (command === "paper-club" || command === "builders-club") {
+    try {
+      const member = await lookupMember(interaction.user.id);
+      if (!member) {
+        await interaction.editReply("You need to `/join` the graph first before scheduling events.");
+        return;
+      }
+
+      const dateStr = interaction.options.getString("date", true).trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+        await interaction.editReply("Date must be YYYY-MM-DD format (e.g. 2026-03-14).");
+        return;
+      }
+      const eventDate = new Date(dateStr);
+      if (isNaN(eventDate.getTime()) || eventDate <= new Date()) {
+        await interaction.editReply("Date must be a valid future date.");
+        return;
+      }
+
+      const isPaperClub = command === "paper-club";
+      const label = isPaperClub ? "Paper Club" : "Builders Club";
+
+      let title: string;
+      let eventPayload: Parameters<typeof mcpGraph.createEventNode>[0];
+
+      if (isPaperClub) {
+        const paperTitle = interaction.options.getString("title", true).trim();
+        const paperUrl = interaction.options.getString("paper") || undefined;
+        title = `Paper Club: ${paperTitle}`;
+        eventPayload = {
+          title,
+          description: `Hosted by ${interaction.user.username}. ${paperTitle}`,
+          event_date: dateStr,
+          event_type: "paper-club",
+          presenter_name: interaction.user.username,
+          presenter_discord_id: interaction.user.id,
+          presenter_node_id: member.id,
+          paper_title: paperTitle,
+          paper_url: paperUrl,
+        };
+      } else {
+        const topic = interaction.options.getString("topic", true).trim();
+        title = `Builders Club: ${topic}`;
+        eventPayload = {
+          title,
+          description: `Hosted by ${interaction.user.username}. ${topic}`,
+          event_date: dateStr,
+          event_type: "builders-club",
+          presenter_name: interaction.user.username,
+          presenter_discord_id: interaction.user.id,
+          presenter_node_id: member.id,
+          topic,
+        };
+      }
+
+      const eventNode = await mcpGraph.createEventNode(eventPayload);
+
+      // Link member -> event
+      await mcpGraph.createMemberEdge(member.id, eventNode.id, `hosting ${label} session`);
+
+      const reply = `**${label} scheduled!**\n📅 ${dateStr}\n📝 ${title}\n🎤 ${interaction.user.username}\n\nEvent node #${eventNode.id} created in the graph.`;
+      await interaction.editReply(reply);
+      await logTrace(profile, traceSource, `/${command}`, reply, {
+        retrieval_method: "event_create", context_node_ids: [eventNode.id], member_id: member.id,
+        is_slash_command: true, slash_command: command, is_kickoff: false, latency_ms: Date.now() - startTime
+      });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await interaction.editReply(`Couldn't schedule the event: ${msg}`);
     }
     return;
   }
@@ -1302,7 +1375,18 @@ async function registerSlashCommands(profile: BotProfile): Promise<void> {
       .setDescription("See what's new and interesting in Latent Space"),
     new SlashCommandBuilder()
       .setName("join")
-      .setDescription("Add yourself to the Latent Space knowledge graph")
+      .setDescription("Add yourself to the Latent Space knowledge graph"),
+    new SlashCommandBuilder()
+      .setName("paper-club")
+      .setDescription("Schedule a Paper Club session")
+      .addStringOption((opt) => opt.setName("date").setDescription("Session date (YYYY-MM-DD)").setRequired(true))
+      .addStringOption((opt) => opt.setName("title").setDescription("Paper title").setRequired(true))
+      .addStringOption((opt) => opt.setName("paper").setDescription("URL to the paper").setRequired(false)),
+    new SlashCommandBuilder()
+      .setName("builders-club")
+      .setDescription("Schedule a Builders Club session")
+      .addStringOption((opt) => opt.setName("date").setDescription("Session date (YYYY-MM-DD)").setRequired(true))
+      .addStringOption((opt) => opt.setName("topic").setDescription("Session topic").setRequired(true)),
   ].map((c) => c.toJSON());
 
   const rest = new REST({ version: "10" }).setToken(profile.token);
