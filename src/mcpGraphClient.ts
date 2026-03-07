@@ -290,6 +290,29 @@ export class McpGraphClient {
     return { id };
   }
 
+  async getBookedDates(eventType: string, dates: string[]): Promise<Map<string, string>> {
+    if (!dates.length) return new Map();
+    const escapedType = eventType.replace(/'/g, "''");
+    const dateList = dates.map((d) => `'${d.replace(/'/g, "''")}'`).join(", ");
+    const sql =
+      "SELECT event_date, json_extract(metadata, '$.presenter_name') AS presenter " +
+      "FROM nodes " +
+      "WHERE node_type = 'event' " +
+      `AND json_extract(metadata, '$.event_type') = '${escapedType}' ` +
+      `AND json_extract(metadata, '$.event_status') = 'scheduled' ` +
+      `AND event_date IN (${dateList})`;
+
+    const result = await this.callTool("ls_sqlite_query", { sql });
+    const rows = ((result.structuredContent as { rows?: unknown[] } | undefined)?.rows || []) as Array<
+      Record<string, unknown>
+    >;
+    const map = new Map<string, string>();
+    for (const row of rows) {
+      map.set(String(row.event_date), String(row.presenter || "someone"));
+    }
+    return map;
+  }
+
   async checkEventSlot(eventType: string, date: string): Promise<{ id: number; title: string; presenter: string } | null> {
     const escaped = date.replace(/'/g, "''");
     const escapedType = eventType.replace(/'/g, "''");

@@ -59,6 +59,31 @@ const rateLimitByUser = new Map<string, number>();
 const rateLimitByChannel = new Map<string, number>();
 const activeDebates = new Set<string>();
 
+type SchedulingSession = {
+  eventType: "paper-club" | "builders-club";
+  memberId: number;
+  memberDiscordId: string;
+  memberUsername: string;
+  availableDates: string[];  // YYYY-MM-DD strings the user can pick from
+  step: "pick_date" | "pick_title";
+  chosenDate?: string;
+};
+const schedulingSessions = new Map<string, SchedulingSession>(); // threadId -> session
+
+function getNextDatesForDay(targetDay: number, count: number): string[] {
+  const dates: string[] = [];
+  const d = new Date();
+  d.setUTCHours(12, 0, 0, 0);
+  d.setUTCDate(d.getUTCDate() + 1); // start from tomorrow
+  while (dates.length < count) {
+    if (d.getUTCDay() === targetDay) {
+      dates.push(d.toISOString().slice(0, 10));
+    }
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return dates;
+}
+
 function requiredEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
@@ -1000,6 +1025,125 @@ function startKickoffServer(): void {
   });
 }
 
+async function handleSchedulingReply(profile: BotProfile, message: Message, session: SchedulingSession): Promise<void> {
+  const text = message.content.trim();
+  const isPaperClub = session.eventType === "paper-club";
+  const label = isPaperClub ? "Paper Club" : "Builders Club";
+
+  if (session.step === "pick_date") {
+    // Parse: expect a number (1-4) optionally followed by title/topic text
+    const match = text.match(/^(\d)\s*(.*)/s);
+    if (!match) {
+      await message.reply(`Reply with a number (1-${session.availableDates.length}) to pick a date.`);
+      return;
+    }
+
+    const pick = parseInt(match[1], 10);
+    if (pick < 1 || pick > session.availableDates.length) {
+      await message.reply(`Pick a number between 1 and ${session.availableDates.length}.`);
+      return;
+    }
+
+    const chosenDate = session.availableDates[pick - 1];
+    const titleText = match[2]?.trim();
+
+    // If they included the title/topic in the same message, create the event immediately
+    if (titleText) {
+      await createScheduledEvent(profile, message, session, chosenDate, titleText);
+      return;
+    }
+
+    // Otherwise, ask for title/topic
+    session.chosenDate = chosenDate;
+    session.step = "pick_title";
+    const dateLabel = new Date(chosenDate + "T12:00:00Z").toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
+    const ask = isPaperClub
+      ? `Got it — **${dateLabel}**. What paper are you presenting? (title, and optionally a URL)`
+      : `Got it — **${dateLabel}**. What's your topic?`;
+    await message.reply(ask);
+    return;
+  }
+
+  if (session.step === "pick_title") {
+    if (!text) {
+      const ask = isPaperClub ? "What paper are you presenting?" : "What's your topic?";
+      await message.reply(ask);
+      return;
+    }
+    await createScheduledEvent(profile, message, session, session.chosenDate!, text);
+    return;
+  }
+}
+
+async function createScheduledEvent(
+  profile: BotProfile,
+  message: Message,
+  session: SchedulingSession,
+  dateStr: string,
+  titleText: string
+): Promise<void> {
+  const isPaperClub = session.eventType === "paper-club";
+  const label = isPaperClub ? "Paper Club" : "Builders Club";
+
+  try {
+    // For paper club, try to extract a URL from the text
+    let paperUrl: string | undefined;
+    let cleanTitle = titleText;
+    if (isPaperClub) {
+      const urlMatch = titleText.match(/(https?:\/\/\S+)/);
+      if (urlMatch) {
+        paperUrl = urlMatch[1];
+        cleanTitle = titleText.replace(urlMatch[0], "").trim();
+      }
+    }
+
+    const title = `${label}: ${cleanTitle}`;
+    const eventPayload: Parameters<typeof mcpGraph.createEventNode>[0] = isPaperClub
+      ? {
+          title,
+          description: `Hosted by ${session.memberUsername}. ${cleanTitle}`,
+          event_date: dateStr,
+          event_type: "paper-club",
+          presenter_name: session.memberUsername,
+          presenter_discord_id: session.memberDiscordId,
+          presenter_node_id: session.memberId,
+          paper_title: cleanTitle,
+          paper_url: paperUrl,
+        }
+      : {
+          title,
+          description: `Hosted by ${session.memberUsername}. ${cleanTitle}`,
+          event_date: dateStr,
+          event_type: "builders-club",
+          presenter_name: session.memberUsername,
+          presenter_discord_id: session.memberDiscordId,
+          presenter_node_id: session.memberId,
+          topic: cleanTitle,
+        };
+
+    const eventNode = await mcpGraph.createEventNode(eventPayload);
+    await mcpGraph.createMemberEdge(session.memberId, eventNode.id, `hosting ${label} session`);
+
+    const dateLabel = new Date(dateStr + "T12:00:00Z").toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
+    const reply = `**${label} scheduled!**\n📅 ${dateLabel}\n📝 ${cleanTitle}\n🎤 ${session.memberUsername}`;
+    await message.reply(reply);
+
+    // Clean up session
+    schedulingSessions.delete(message.channelId);
+
+    // Log trace
+    const traceSource = { userId: session.memberDiscordId, username: session.memberUsername, channelId: message.channelId, messageId: message.id };
+    await logTrace(profile, traceSource, `/${session.eventType}`, reply, {
+      retrieval_method: "event_create", context_node_ids: [eventNode.id], member_id: session.memberId,
+      is_slash_command: true, slash_command: session.eventType, is_kickoff: false, latency_ms: 0
+    });
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    await message.reply(`Couldn't create the event: ${msg}`);
+    schedulingSessions.delete(message.channelId);
+  }
+}
+
 async function handleMessage(client: Client, profile: BotProfile, message: Message): Promise<void> {
   if (message.webhookId) {
     console.log(
@@ -1019,6 +1163,13 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   const ownedThread = owner === profile.name;
   if (!withinRateLimit(message, profile.name, { ownedThread })) return;
   processedMessageIds.add(dedupeKey);
+
+  // Intercept scheduling thread replies
+  const schedulingSession = schedulingSessions.get(message.channelId);
+  if (schedulingSession && message.author.id === schedulingSession.memberDiscordId) {
+    await handleSchedulingReply(profile, message, schedulingSession);
+    return;
+  }
 
   mcpGraph.clearTraces();
   const startTime = Date.now();
@@ -1229,85 +1380,70 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
         return;
       }
 
-      const dateStr = interaction.options.getString("date", true).trim();
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
-        await interaction.editReply("Date must be YYYY-MM-DD format (e.g. 2026-03-14).");
-        return;
-      }
-      const eventDate = new Date(dateStr + "T12:00:00");
-      if (isNaN(eventDate.getTime()) || eventDate <= new Date()) {
-        await interaction.editReply("Date must be a valid future date.");
-        return;
-      }
-
       const isPaperClub = command === "paper-club";
-
-      // Validate day of week: Paper Club = Wednesday (3), Builders Club = Friday (5)
-      const dayOfWeek = eventDate.getUTCDay();
-      if (isPaperClub && dayOfWeek !== 3) {
-        await interaction.editReply("Paper Club runs on **Wednesdays**. Pick a Wednesday date.");
-        return;
-      }
-      if (!isPaperClub && dayOfWeek !== 5) {
-        await interaction.editReply("Builders Club runs on **Fridays** (Saturday morning Sydney). Pick a Friday date.");
-        return;
-      }
-
-      // Check for double booking
-      const existing = await mcpGraph.checkEventSlot(command, dateStr);
-      if (existing) {
-        await interaction.editReply(`That slot is already booked by **${existing.presenter}**: "${existing.title}". Try a different week.`);
-        return;
-      }
       const label = isPaperClub ? "Paper Club" : "Builders Club";
+      const targetDay = isPaperClub ? 3 : 5; // Wednesday or Friday
+      const nextDates = getNextDatesForDay(targetDay, 6);
 
-      let title: string;
-      let eventPayload: Parameters<typeof mcpGraph.createEventNode>[0];
+      // Check which dates are already booked
+      const booked = await mcpGraph.getBookedDates(command, nextDates);
+      const available = nextDates.filter((d) => !booked.has(d)).slice(0, 4);
 
-      if (isPaperClub) {
-        const paperTitle = interaction.options.getString("title", true).trim();
-        const paperUrl = interaction.options.getString("paper") || undefined;
-        title = `Paper Club: ${paperTitle}`;
-        eventPayload = {
-          title,
-          description: `Hosted by ${interaction.user.username}. ${paperTitle}`,
-          event_date: dateStr,
-          event_type: "paper-club",
-          presenter_name: interaction.user.username,
-          presenter_discord_id: interaction.user.id,
-          presenter_node_id: member.id,
-          paper_title: paperTitle,
-          paper_url: paperUrl,
-        };
-      } else {
-        const topic = interaction.options.getString("topic", true).trim();
-        title = `Builders Club: ${topic}`;
-        eventPayload = {
-          title,
-          description: `Hosted by ${interaction.user.username}. ${topic}`,
-          event_date: dateStr,
-          event_type: "builders-club",
-          presenter_name: interaction.user.username,
-          presenter_discord_id: interaction.user.id,
-          presenter_node_id: member.id,
-          topic,
-        };
+      if (!available.length) {
+        await interaction.editReply(`All upcoming ${label} slots are booked! Try again later.`);
+        return;
       }
 
-      const eventNode = await mcpGraph.createEventNode(eventPayload);
-
-      // Link member -> event
-      await mcpGraph.createMemberEdge(member.id, eventNode.id, `hosting ${label} session`);
-
-      const reply = `**${label} scheduled!**\n📅 ${dateStr}\n📝 ${title}\n🎤 ${interaction.user.username}\n\nEvent node #${eventNode.id} created in the graph.`;
-      await interaction.editReply(reply);
-      await logTrace(profile, traceSource, `/${command}`, reply, {
-        retrieval_method: "event_create", context_node_ids: [eventNode.id], member_id: member.id,
-        is_slash_command: true, slash_command: command, is_kickoff: false, latency_ms: Date.now() - startTime
+      const dayLabel = isPaperClub ? "Wed" : "Fri";
+      const lines = available.map((d, i) => {
+        const date = new Date(d + "T12:00:00Z");
+        const month = date.toLocaleString("en-US", { month: "short", timeZone: "UTC" });
+        const day = date.getUTCDate();
+        return `**${i + 1}.** ${dayLabel} ${month} ${day} (${d})`;
       });
+
+      const prompt = isPaperClub
+        ? "Reply with the **number** of the date you want, and the **paper title** (and optionally a URL)."
+        : "Reply with the **number** of the date you want, and your **topic**.";
+
+      const reply = `**Schedule a ${label} session**\n\nAvailable dates:\n${lines.join("\n")}\n\n${prompt}`;
+
+      const message = await interaction.editReply(reply);
+
+      // Create a thread from the reply for the scheduling conversation
+      let threadId: string;
+      try {
+        const channel = interaction.channel;
+        if (channel && "threads" in channel && channel.threads) {
+          const thread = await channel.threads.create({
+            name: `${label}: ${interaction.user.username} scheduling`,
+            autoArchiveDuration: ThreadAutoArchiveDuration.OneHour,
+            startMessage: message.id,
+            reason: `${label} scheduling thread`,
+          });
+          threadId = thread.id;
+        } else {
+          threadId = interaction.channelId || "";
+        }
+      } catch {
+        threadId = interaction.channelId || "";
+      }
+
+      schedulingSessions.set(threadId, {
+        eventType: command as "paper-club" | "builders-club",
+        memberId: member.id,
+        memberDiscordId: interaction.user.id,
+        memberUsername: interaction.user.username,
+        availableDates: available,
+        step: "pick_date",
+      });
+
+      // Auto-expire session after 10 minutes
+      setTimeout(() => schedulingSessions.delete(threadId), 10 * 60 * 1000);
+
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      await interaction.editReply(`Couldn't schedule the event: ${msg}`);
+      await interaction.editReply(`Couldn't start scheduling: ${msg}`);
     }
     return;
   }
@@ -1404,15 +1540,10 @@ async function registerSlashCommands(profile: BotProfile): Promise<void> {
       .setDescription("Add yourself to the Latent Space knowledge graph"),
     new SlashCommandBuilder()
       .setName("paper-club")
-      .setDescription("Schedule a Paper Club session")
-      .addStringOption((opt) => opt.setName("date").setDescription("Session date (YYYY-MM-DD)").setRequired(true))
-      .addStringOption((opt) => opt.setName("title").setDescription("Paper title").setRequired(true))
-      .addStringOption((opt) => opt.setName("paper").setDescription("URL to the paper").setRequired(false)),
+      .setDescription("Schedule a Paper Club session — pick a date and paper"),
     new SlashCommandBuilder()
       .setName("builders-club")
-      .setDescription("Schedule a Builders Club session")
-      .addStringOption((opt) => opt.setName("date").setDescription("Session date (YYYY-MM-DD)").setRequired(true))
-      .addStringOption((opt) => opt.setName("topic").setDescription("Session topic").setRequired(true)),
+      .setDescription("Schedule a Builders Club session — pick a date and topic"),
   ].map((c) => c.toJSON());
 
   const rest = new REST({ version: "10" }).setToken(profile.token);
