@@ -23,15 +23,6 @@ type BotProfile = {
   name: "Slop";
   token: string;
   model: string;
-  systemPrompt: string;
-  appId?: string;
-};
-
-type BotProfileSeed = {
-  name: "Slop";
-  token: string;
-  model: string;
-  soulFile: string;
   appId?: string;
 };
 
@@ -129,6 +120,7 @@ type MemberMetadata = {
   role?: string;
   company?: string;
   location?: string;
+  interaction_preference?: string;
 };
 
 type MemberNode = {
@@ -138,39 +130,14 @@ type MemberNode = {
   metadata: MemberMetadata;
 };
 
-const profileSeeds: BotProfileSeed[] = [
+const profiles: BotProfile[] = [
   {
     name: "Slop",
     token: requiredEnv("BOT_TOKEN_SLOP"),
     model: SLOP_MODEL,
     appId: process.env.BOT_APP_ID_SLOP,
-    soulFile: "slop.soul.md"
   }
 ];
-
-function readSoulDocument(filename: string): string {
-  const soulPath = path.join(process.cwd(), "personas", filename);
-  if (!fs.existsSync(soulPath)) {
-    throw new Error(`Missing SOUL file: ${soulPath}`);
-  }
-  const text = fs.readFileSync(soulPath, "utf8").trim();
-  if (!text) {
-    throw new Error(`SOUL file is empty: ${soulPath}`);
-  }
-  return text;
-}
-
-function buildProfiles(): BotProfile[] {
-  return profileSeeds.map((seed) => ({
-    name: seed.name,
-    token: seed.token,
-    model: seed.model,
-    appId: seed.appId,
-    systemPrompt: readSoulDocument(seed.soulFile)
-  }));
-}
-
-const profiles = buildProfiles();
 
 function cleanUserPrompt(message: Message, botUserId: string): string {
   const mentionPattern = new RegExp(`<@!?${botUserId}>`, "g");
@@ -272,13 +239,42 @@ function formatMemberContext(member: MemberNode): string {
   if (member.metadata.company) profileLines.push(`Company: ${member.metadata.company}`);
   if (member.metadata.location) profileLines.push(`Location: ${member.metadata.location}`);
   profileLines.push(`Interests: ${interests}`);
+  if (member.metadata.interaction_preference) {
+    profileLines.push(`Interaction preference: ${member.metadata.interaction_preference}`);
+  }
   profileLines.push(`Last active: ${lastActive}`);
   profileLines.push(`Recent interactions: ${recentNotes || "none"}`);
   return (
     `[MEMBER CONTEXT]\n` +
     profileLines.join("\n") + "\n" +
-    `Use this to personalize your response naturally.`
+    `Use this to personalize your response. Update interaction_preference in <profile> when you learn how they like to interact.`
   );
+}
+
+function buildSystemPrompt(options: {
+  skillsContext: string;
+  memberContext: string;
+}): string {
+  const identity = [
+    "[IDENTITY]",
+    "You are Slop — Latent Space community's AI. Opinionated, sharp, concise.",
+    "Lead with your take. Challenge lazy thinking. Short sentences hit harder — use them.",
+    "Bold your strongest claims. End with a question or challenge when debating.",
+    "Never agree just to be agreeable. Never hedge. Never use filler like 'interesting' or 'fascinating'.",
+    "You are not an assistant. You are an interlocutor.",
+  ].join("\n");
+
+  const rules = [
+    "[RULES]",
+    "Search the knowledge base BEFORE answering factual questions. Don't guess — look it up.",
+    "Always link to sources: [Title](url). Never reference content without a link.",
+    "Never fabricate names, dates, episodes, quotes, or links. If tools return nothing, say so.",
+    "Mark speculation explicitly: 'No hard data, but...' or 'Extrapolating here...'",
+  ].join("\n");
+
+  return [identity, rules, options.skillsContext, options.memberContext]
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 function summarizeUserMessage(message: string): string {
@@ -310,7 +306,8 @@ function parseMetadata(raw: unknown): MemberMetadata {
     interests: Array.isArray(data.interests) ? data.interests.map((x) => String(x)) : [],
     role: data.role ? String(data.role) : undefined,
     company: data.company ? String(data.company) : undefined,
-    location: data.location ? String(data.location) : undefined
+    location: data.location ? String(data.location) : undefined,
+    interaction_preference: data.interaction_preference ? String(data.interaction_preference) : undefined
   };
 }
 
@@ -347,7 +344,7 @@ async function createMemberNodeFromUser(
 
 function parseProfileBlock(response: string): {
   clean: string;
-  profile: { role?: string; company?: string; location?: string; interests?: string[] } | null;
+  profile: { role?: string; company?: string; location?: string; interests?: string[]; interaction_preference?: string } | null;
 } {
   const match = response.match(/<profile>\s*(\{[\s\S]*?\})\s*<\/profile>/);
   if (!match) return { clean: response, profile: null };
@@ -363,7 +360,7 @@ async function updateMemberAfterInteraction(
   member: MemberNode,
   userMessage: string,
   retrievalNodeIds: number[],
-  profileUpdate?: { role?: string; company?: string; location?: string; interests?: string[] } | null,
+  profileUpdate?: { role?: string; company?: string; location?: string; interests?: string[]; interaction_preference?: string } | null,
   avatarUrl?: string
 ): Promise<void> {
   const nowIso = new Date().toISOString();
@@ -384,6 +381,9 @@ async function updateMemberAfterInteraction(
       metadata.interests = Array.from(
         new Set([...(member.metadata.interests || []), ...profileUpdate.interests])
       ).slice(0, 25);
+    }
+    if (profileUpdate.interaction_preference) {
+      metadata.interaction_preference = profileUpdate.interaction_preference;
     }
   }
 
@@ -566,15 +566,13 @@ async function generateResponse(
   profile: BotProfile,
   userPrompt: string,
   context: string,
-  options?: { requireSources?: boolean; additionalSystemContext?: string }
+  options?: { requireSources?: boolean; systemPrompt?: string }
 ): Promise<string> {
   const requireSources = options?.requireSources ?? true;
-  const additionalSystemContext = options?.additionalSystemContext?.trim() || "";
-  const profileStyleLine =
-    "Style: opinionated, sharp, slightly unhinged tone. Keep it concise but punchy. Still ground factual claims in provided context. IMPORTANT: When referencing specific content (episodes, articles, AINews), always include the direct link. Format: [Title](url). Never reference content without linking to it.";
-  const groundingLine = requireSources
-    ? "Use ONLY the supplied context when making factual claims. Return a compact answer and include a short 'Sources' list with direct links. The context includes markdown links like [Title](url) — pass these through in your response so users can click to the source."
-    : "You can respond conversationally for greetings/smalltalk. Do not fabricate factual claims.";
+  const systemContent = options?.systemPrompt || buildSystemPrompt({ skillsContext: "", memberContext: "" });
+  const contextNote = requireSources
+    ? "Use the supplied context for factual claims. Include a short Sources list with links."
+    : "";
   const payload = {
     model: profile.model,
     temperature: 0.6,
@@ -582,7 +580,7 @@ async function generateResponse(
     messages: [
       {
         role: "system",
-        content: `${profile.systemPrompt}\n\n${groundingLine}\n${profileStyleLine}${additionalSystemContext ? `\n\n${additionalSystemContext}` : ""}`
+        content: contextNote ? `${systemContent}\n\n${contextNote}` : systemContent
       },
       {
         role: "user",
@@ -637,20 +635,15 @@ const MAX_TOOL_RESULT_CHARS = 4000;
 async function generateAgenticResponse(
   profile: BotProfile,
   userPrompt: string,
-  options?: { additionalSystemContext?: string }
+  options?: { systemPrompt?: string }
 ): Promise<AgenticResult> {
-  const additionalSystemContext = options?.additionalSystemContext?.trim() || "";
+  const systemContent = options?.systemPrompt || buildSystemPrompt({ skillsContext: "", memberContext: "" });
   const tools = await mcpGraph.getToolDefinitions();
-
-  const profileStyleLine =
-    "Style: opinionated, sharp, slightly unhinged tone. Keep it concise but punchy. Still ground factual claims in tool results. IMPORTANT: When referencing specific content (episodes, articles, AINews), always include the direct link. Format: [Title](url). Never reference content without linking to it.";
-  const groundingLine =
-    "Use your tools to search the knowledge base BEFORE answering factual questions. Include a short 'Sources' list with direct links in your final response. Never fabricate content — if tools return nothing relevant, say so.";
 
   const messages: OpenRouterMessage[] = [
     {
       role: "system",
-      content: `${profile.systemPrompt}\n\n${groundingLine}\n${profileStyleLine}${additionalSystemContext ? `\n\n${additionalSystemContext}` : ""}`
+      content: systemContent
     },
     { role: "user", content: userPrompt }
   ];
@@ -1193,20 +1186,27 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   const dedupeKey = `${profile.name}:${message.id}`;
   if (processedMessageIds.has(dedupeKey)) return;
   const botUserId = client.user?.id;
-  if (!botUserId || !isAllowedChannel(message) || !shouldRespondToMessage(message, botUserId, profile.name)) {
+  if (!botUserId) return;
+  if (message.author.bot && !message.webhookId) return;
+
+  // Intercept scheduling thread replies BEFORE the general shouldRespond gate.
+  // Scheduling threads are named "Paper Club: ..." not "Slop: ...", so
+  // shouldRespondToMessage would reject them.
+  const schedulingSession = schedulingSessions.get(message.channelId);
+  if (schedulingSession && message.author.id === schedulingSession.memberDiscordId) {
+    if (processedMessageIds.has(dedupeKey)) return;
+    processedMessageIds.add(dedupeKey);
+    await handleSchedulingReply(profile, message, schedulingSession);
+    return;
+  }
+
+  if (!isAllowedChannel(message) || !shouldRespondToMessage(message, botUserId, profile.name)) {
     return;
   }
   const owner = getThreadOwnerBotName(message);
   const ownedThread = owner === profile.name;
   if (!withinRateLimit(message, profile.name, { ownedThread })) return;
   processedMessageIds.add(dedupeKey);
-
-  // Intercept scheduling thread replies
-  const schedulingSession = schedulingSessions.get(message.channelId);
-  if (schedulingSession && message.author.id === schedulingSession.memberDiscordId) {
-    await handleSchedulingReply(profile, message, schedulingSession);
-    return;
-  }
 
   mcpGraph.clearTraces();
   const startTime = Date.now();
@@ -1218,15 +1218,10 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   await destination.sendTyping();
   const skillsContext = loadSkillsContext();
   const member = await lookupMember(message.author.id);
-  const memberSystemContext = member
+  const memberContext = member
     ? formatMemberContext(member)
     : "[MEMBER STATUS] This user is not in the member graph yet. Casually mention `/join` when it naturally fits.";
-  const additionalSystemContext = [
-    skillsContext,
-    memberSystemContext
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+  const systemPrompt = buildSystemPrompt({ skillsContext, memberContext });
 
   // /wassup fetches its own context, skip general KB query
   if (maybeCommand?.command === "wassup") {
@@ -1238,7 +1233,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
         profile,
         "What's new in Latent Space? Summarize the most interesting recent content — what dropped, why it matters, and what builders should pay attention to.",
         wassupContext,
-        { additionalSystemContext }
+        { systemPrompt }
       );
       await destination.send(modelBadge(profile.model));
       const parts = splitForDiscord(output);
@@ -1268,7 +1263,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
     try {
       const rawOutput = await generateResponse(profile, prompt, "No graph retrieval needed for greeting/smalltalk.", {
         requireSources: false,
-        additionalSystemContext
+        systemPrompt
       });
       const { clean: output, profile: profileUpdate } = parseProfileBlock(rawOutput);
       await destination.send(modelBadge(profile.model));
@@ -1308,7 +1303,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
       maybeCommand?.command === "tldr"
         ? `Give a concise TLDR on: ${prompt}. Stick to what the knowledge base says — key points, why it matters, and link to sources.`
         : prompt;
-    const { text: rawOutput, toolsUsed } = await generateAgenticResponse(profile, effectivePrompt, { additionalSystemContext });
+    const { text: rawOutput, toolsUsed } = await generateAgenticResponse(profile, effectivePrompt, { systemPrompt });
     const { clean: output, profile: profileUpdate } = parseProfileBlock(rawOutput);
     // Extract node IDs from tool call traces for member edge creation
     const nodeIds = mcpGraph.callTraces
@@ -1485,15 +1480,10 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
 
   const skillsContext = loadSkillsContext();
   const member = await lookupMember(interaction.user.id);
-  const memberSystemContext = member
+  const memberContext = member
     ? formatMemberContext(member)
     : "[MEMBER STATUS] This user is not in the member graph yet. Casually mention `/join` when it naturally fits.";
-  const additionalSystemContext = [
-    skillsContext,
-    memberSystemContext
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+  const systemPrompt = buildSystemPrompt({ skillsContext, memberContext });
 
   if (command === "wassup") {
     const latest = await queryLatestContent(undefined, 6);
@@ -1503,7 +1493,7 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
       profile,
       "What's new in Latent Space? Summarize the most interesting recent content — what dropped, why it matters, and what builders should pay attention to.",
       context,
-      { additionalSystemContext }
+      { systemPrompt }
     );
     await interaction.editReply(
       `${modelBadge(profile.model)}\n\n${output}\n\n${toolsFooter(contextMethod)}`.slice(0, 1900)
@@ -1520,7 +1510,7 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
   const { text: output, toolsUsed } = await generateAgenticResponse(
     profile,
     `Give a concise TLDR on: ${query}. Stick to what the knowledge base says — key points, why it matters, and link to sources.`,
-    { additionalSystemContext }
+    { systemPrompt }
   );
   await interaction.editReply(
     `${modelBadge(profile.model)}\n\n${output}\n\n${agenticToolsFooter(toolsUsed)}`.slice(0, 1900)
