@@ -92,8 +92,8 @@ const db = createLibsqlClient({
   authToken: TURSO_AUTH_TOKEN
 });
 const mcpGraph = new McpGraphClient();
-let cachedGuideSnippet = "";
-let cachedMemberGuide = "";
+let cachedSkillSnippet = "";
+let cachedMemberSkill = "";
 
 type MemberMetadata = {
   discord_id: string;
@@ -440,32 +440,32 @@ function toolsFooter(method: string): string {
   return `🛠️ ${formatToolMethod(method)}`;
 }
 
-async function loadGuideSnippet(): Promise<string> {
-  if (cachedGuideSnippet) return cachedGuideSnippet;
+async function loadSkillSnippet(): Promise<string> {
+  if (cachedSkillSnippet) return cachedSkillSnippet;
   try {
-    const guide = await mcpGraph.readGuide("start-here");
-    const compact = guide
+    const skill = await mcpGraph.readSkill("start-here");
+    const compact = skill
       .split("\n")
       .map((line) => line.trim())
       .filter(Boolean)
       .slice(0, 14)
       .join(" ");
-    cachedGuideSnippet = compact.slice(0, 900);
+    cachedSkillSnippet = compact.slice(0, 900);
   } catch (error) {
-    console.warn("Unable to load MCP guide context:", error);
-    cachedGuideSnippet = "";
+    console.warn("Unable to load MCP skill context:", error);
+    cachedSkillSnippet = "";
   }
-  return cachedGuideSnippet;
+  return cachedSkillSnippet;
 }
 
-function loadMemberGuide(): string {
-  if (cachedMemberGuide) return cachedMemberGuide;
+function loadMemberSkill(): string {
+  if (cachedMemberSkill) return cachedMemberSkill;
   try {
-    cachedMemberGuide = fs.readFileSync(path.join(__dirname, "..", "guides", "member-profiles.md"), "utf-8");
+    cachedMemberSkill = fs.readFileSync(path.join(__dirname, "..", "guides", "member-profiles.md"), "utf-8");
   } catch {
-    cachedMemberGuide = "";
+    cachedMemberSkill = "";
   }
-  return cachedMemberGuide;
+  return cachedMemberSkill;
 }
 
 async function ensureDestinationChannel(message: Message, botName: string): Promise<DestinationChannel> {
@@ -1020,15 +1020,15 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   const prompt = maybeCommand?.query || cleanUserPrompt(message, botUserId);
   const destination = await ensureDestinationChannel(message, profile.name);
   await destination.sendTyping();
-  const guideSnippet = await loadGuideSnippet();
-  const memberGuide = loadMemberGuide();
+  const skillSnippet = await loadSkillSnippet();
+  const memberSkill = loadMemberSkill();
   const member = await lookupMember(message.author.id);
   const memberSystemContext = member
     ? formatMemberContext(member)
     : "[MEMBER STATUS] This user is not in the member graph yet. Casually mention `/join` when it naturally fits.";
   const additionalSystemContext = [
-    guideSnippet ? `[GUIDE CONTEXT]\n${guideSnippet}` : "",
-    memberGuide ? `[MEMBER GUIDE]\n${memberGuide}` : "",
+    skillSnippet ? `[SKILL CONTEXT]\n${skillSnippet}` : "",
+    memberSkill ? `[MEMBER SKILL]\n${memberSkill}` : "",
     memberSystemContext
   ]
     .filter(Boolean)
@@ -1213,15 +1213,15 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
     return;
   }
 
-  const guideSnippet = await loadGuideSnippet();
-  const memberGuide = loadMemberGuide();
+  const skillSnippet = await loadSkillSnippet();
+  const memberSkill = loadMemberSkill();
   const member = await lookupMember(interaction.user.id);
   const memberSystemContext = member
     ? formatMemberContext(member)
     : "[MEMBER STATUS] This user is not in the member graph yet. Casually mention `/join` when it naturally fits.";
   const additionalSystemContext = [
-    guideSnippet ? `[GUIDE CONTEXT]\n${guideSnippet}` : "",
-    memberGuide ? `[MEMBER GUIDE]\n${memberGuide}` : "",
+    skillSnippet ? `[SKILL CONTEXT]\n${skillSnippet}` : "",
+    memberSkill ? `[MEMBER SKILL]\n${memberSkill}` : "",
     memberSystemContext
   ]
     .filter(Boolean)
@@ -1355,7 +1355,7 @@ async function main(): Promise<void> {
   await mcpGraph.connect();
   const toolDefs = await mcpGraph.getToolDefinitions();
   console.log(`MCP tools cached: ${toolDefs.length} read-only tools available for LLM`);
-  await loadGuideSnippet();
+  await loadSkillSnippet();
   await Promise.all(profiles.map((profile) => startBot(profile)));
   startKickoffServer();
 }

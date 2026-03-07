@@ -70,8 +70,8 @@ const READ_ONLY_TOOLS = new Set([
   "ls_list_dimensions",
   "ls_search_content",
   "ls_sqlite_query",
-  "ls_list_guides",
-  "ls_read_guide"
+  "ls_list_skills",
+  "ls_read_skill"
 ]);
 
 export class McpGraphClient {
@@ -170,8 +170,8 @@ export class McpGraphClient {
     return result;
   }
 
-  async readGuide(name: string): Promise<string> {
-    const result = await this.callTool("ls_read_guide", { name });
+  async readSkill(name: string): Promise<string> {
+    const result = await this.callTool("ls_read_skill", { name });
     const structured = result.structuredContent as { content?: unknown } | undefined;
     if (structured && typeof structured.content === "string") {
       return structured.content;
