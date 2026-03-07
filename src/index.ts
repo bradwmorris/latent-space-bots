@@ -874,6 +874,8 @@ async function runDeterministicKickoff(payload: KickoffPayload): Promise<{ ok: t
   }
 
   activeDebates.add(kickoffKey);
+  const startTime = Date.now();
+  const channelId = payload.channelId || BOT_TALK_CHANNEL_ID || "unknown";
   try {
     const slopPrompt = [
       "New content just dropped in Latent Space. Break it down.",
@@ -890,6 +892,23 @@ async function runDeterministicKickoff(payload: KickoffPayload): Promise<{ ok: t
     const { text: output, toolsUsed } = await generateAgenticResponse(slopProfile, slopPrompt);
     await destination.send(`${modelBadge(slopProfile.model)}\n${output}`);
     await destination.send(agenticToolsFooter(toolsUsed));
+
+    const nodeIds = mcpGraph.callTraces
+      .filter((t) => t.tool === "ls_get_nodes" || t.tool === "ls_search_nodes")
+      .flatMap((t) => {
+        const r = t.result as Record<string, unknown> | null;
+        if (r && Array.isArray((r as { nodes?: unknown[] }).nodes)) return ((r as { nodes: Array<Record<string, unknown>> }).nodes).map((n) => Number(n.id)).filter(Number.isFinite);
+        return [];
+      });
+    await logTrace(slopProfile, { userId: "system", username: "kickoff", channelId, messageId: "" }, slopPrompt, output, {
+      retrieval_method: "agentic",
+      context_node_ids: nodeIds,
+      member_id: null,
+      is_slash_command: false,
+      slash_command: null,
+      is_kickoff: true,
+      latency_ms: Date.now() - startTime
+    });
   } finally {
     activeDebates.delete(kickoffKey);
   }
