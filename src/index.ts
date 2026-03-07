@@ -443,14 +443,22 @@ function toolsFooter(method: string): string {
 async function loadSkillSnippet(): Promise<string> {
   if (cachedSkillSnippet) return cachedSkillSnippet;
   try {
-    const skill = await mcpGraph.readSkill("start-here");
-    const compact = skill
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .slice(0, 14)
-      .join(" ");
-    cachedSkillSnippet = compact.slice(0, 900);
+    const skillNames = ["start-here", "event-scheduling"];
+    const parts: string[] = [];
+    for (const name of skillNames) {
+      try {
+        const skill = await mcpGraph.readSkill(name);
+        const compact = skill
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .join(" ");
+        parts.push(compact);
+      } catch {
+        console.warn(`Unable to load skill "${name}", skipping.`);
+      }
+    }
+    cachedSkillSnippet = parts.join("\n\n").slice(0, 2000);
   } catch (error) {
     console.warn("Unable to load MCP skill context:", error);
     cachedSkillSnippet = "";
