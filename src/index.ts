@@ -465,28 +465,29 @@ function toolsFooter(method: string): string {
   return `🛠️ ${formatToolMethod(method)}`;
 }
 
+const EVENT_SCHEDULING_CONTEXT = [
+  "[EVENTS] The knowledge graph has a first-class 'event' node_type for Paper Club and Builders Club sessions.",
+  "Paper Club runs every Wednesday 12pm PT. Builders Club runs every Friday afternoon PT (Saturday 8am Sydney).",
+  "To find upcoming events: SELECT id, title, event_date, json_extract(metadata, '$.presenter_name') AS presenter, json_extract(metadata, '$.event_type') AS event_type FROM nodes WHERE node_type = 'event' AND json_extract(metadata, '$.event_status') = 'scheduled' ORDER BY event_date ASC",
+  "To find past events: same query but event_status = 'completed'.",
+  "Members can schedule via /paper-club or /builders-club slash commands.",
+  "IMPORTANT: When asked about upcoming events or paper clubs, ALWAYS query node_type = 'event' with event_status = 'scheduled'. Do NOT search paper-club or builders-club node types for upcoming sessions — those are recordings, not scheduled events.",
+].join("\n");
+
 async function loadSkillSnippet(): Promise<string> {
   if (cachedSkillSnippet) return cachedSkillSnippet;
   try {
-    const skillNames = ["start-here", "event-scheduling"];
-    const parts: string[] = [];
-    for (const name of skillNames) {
-      try {
-        const skill = await mcpGraph.readSkill(name);
-        const compact = skill
-          .split("\n")
-          .map((line) => line.trim())
-          .filter(Boolean)
-          .join(" ");
-        parts.push(compact);
-      } catch {
-        console.warn(`Unable to load skill "${name}", skipping.`);
-      }
-    }
-    cachedSkillSnippet = parts.join("\n\n").slice(0, 2000);
+    const skill = await mcpGraph.readSkill("start-here");
+    const compact = skill
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(0, 14)
+      .join(" ");
+    cachedSkillSnippet = compact.slice(0, 900) + "\n\n" + EVENT_SCHEDULING_CONTEXT;
   } catch (error) {
     console.warn("Unable to load MCP skill context:", error);
-    cachedSkillSnippet = "";
+    cachedSkillSnippet = EVENT_SCHEDULING_CONTEXT;
   }
   return cachedSkillSnippet;
 }
