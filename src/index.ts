@@ -1226,13 +1226,31 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
         await interaction.editReply("Date must be YYYY-MM-DD format (e.g. 2026-03-14).");
         return;
       }
-      const eventDate = new Date(dateStr);
+      const eventDate = new Date(dateStr + "T12:00:00");
       if (isNaN(eventDate.getTime()) || eventDate <= new Date()) {
         await interaction.editReply("Date must be a valid future date.");
         return;
       }
 
       const isPaperClub = command === "paper-club";
+
+      // Validate day of week: Paper Club = Wednesday (3), Builders Club = Friday (5)
+      const dayOfWeek = eventDate.getUTCDay();
+      if (isPaperClub && dayOfWeek !== 3) {
+        await interaction.editReply("Paper Club runs on **Wednesdays**. Pick a Wednesday date.");
+        return;
+      }
+      if (!isPaperClub && dayOfWeek !== 5) {
+        await interaction.editReply("Builders Club runs on **Fridays** (Saturday morning Sydney). Pick a Friday date.");
+        return;
+      }
+
+      // Check for double booking
+      const existing = await mcpGraph.checkEventSlot(command, dateStr);
+      if (existing) {
+        await interaction.editReply(`That slot is already booked by **${existing.presenter}**: "${existing.title}". Try a different week.`);
+        return;
+      }
       const label = isPaperClub ? "Paper Club" : "Builders Club";
 
       let title: string;

@@ -290,6 +290,31 @@ export class McpGraphClient {
     return { id };
   }
 
+  async checkEventSlot(eventType: string, date: string): Promise<{ id: number; title: string; presenter: string } | null> {
+    const escaped = date.replace(/'/g, "''");
+    const escapedType = eventType.replace(/'/g, "''");
+    const sql =
+      "SELECT id, title, json_extract(metadata, '$.presenter_name') AS presenter " +
+      "FROM nodes " +
+      "WHERE node_type = 'event' " +
+      `AND json_extract(metadata, '$.event_type') = '${escapedType}' ` +
+      `AND json_extract(metadata, '$.event_status') = 'scheduled' ` +
+      `AND event_date = '${escaped}' ` +
+      "LIMIT 1";
+
+    const result = await this.callTool("ls_sqlite_query", { sql });
+    const rows = ((result.structuredContent as { rows?: unknown[] } | undefined)?.rows || []) as Array<
+      Record<string, unknown>
+    >;
+    if (!rows.length) return null;
+    const row = rows[0];
+    return {
+      id: Number(row.id),
+      title: String(row.title || ""),
+      presenter: String(row.presenter || "unknown"),
+    };
+  }
+
   async createMemberEdge(sourceId: number, targetId: number, explanation: string): Promise<void> {
     await this.callTool("ls_create_edge", {
       sourceId,
