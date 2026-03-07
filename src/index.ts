@@ -117,8 +117,6 @@ const db = createLibsqlClient({
   authToken: TURSO_AUTH_TOKEN
 });
 const mcpGraph = new McpGraphClient();
-let cachedSkillSnippet = "";
-let cachedMemberSkill = "";
 
 type MemberMetadata = {
   discord_id: string;
@@ -465,41 +463,59 @@ function toolsFooter(method: string): string {
   return `🛠️ ${formatToolMethod(method)}`;
 }
 
-const EVENT_SCHEDULING_CONTEXT = [
-  "[EVENTS] The knowledge graph has a first-class 'event' node_type for Paper Club and Builders Club sessions.",
-  "Paper Club runs every Wednesday 12pm PT. Builders Club runs every Friday afternoon PT (Saturday 8am Sydney).",
-  "To find upcoming events: SELECT id, title, event_date, json_extract(metadata, '$.presenter_name') AS presenter, json_extract(metadata, '$.event_type') AS event_type FROM nodes WHERE node_type = 'event' AND json_extract(metadata, '$.event_status') = 'scheduled' ORDER BY event_date ASC",
-  "To find past events: same query but event_status = 'completed'.",
-  "Members can schedule via /paper-club or /builders-club slash commands.",
-  "IMPORTANT: When asked about upcoming events or paper clubs, ALWAYS query node_type = 'event' with event_status = 'scheduled'. Do NOT search paper-club or builders-club node types for upcoming sessions — those are recordings, not scheduled events.",
-].join("\n");
+type SkillFrontmatter = {
+  name: string;
+  description: string;
+  when_to_use: string;
+  body: string;
+};
 
-async function loadSkillSnippet(): Promise<string> {
-  if (cachedSkillSnippet) return cachedSkillSnippet;
-  try {
-    const skill = await mcpGraph.readSkill("start-here");
-    const compact = skill
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .slice(0, 14)
-      .join(" ");
-    cachedSkillSnippet = compact.slice(0, 900) + "\n\n" + EVENT_SCHEDULING_CONTEXT;
-  } catch (error) {
-    console.warn("Unable to load MCP skill context:", error);
-    cachedSkillSnippet = EVENT_SCHEDULING_CONTEXT;
-  }
-  return cachedSkillSnippet;
+const SKILLS_DIR = path.join(__dirname, "..", "skills");
+
+function loadSkillFiles(): SkillFrontmatter[] {
+  if (!fs.existsSync(SKILLS_DIR)) return [];
+  return fs.readdirSync(SKILLS_DIR)
+    .filter((f) => f.endsWith(".md"))
+    .map((f) => {
+      const raw = fs.readFileSync(path.join(SKILLS_DIR, f), "utf-8");
+      const fmMatch = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+      if (!fmMatch) return null;
+      const fm: Record<string, string> = {};
+      for (const line of fmMatch[1].split("\n")) {
+        const idx = line.indexOf(":");
+        if (idx > 0) {
+          const key = line.slice(0, idx).trim();
+          const val = line.slice(idx + 1).trim().replace(/^["']|["']$/g, "");
+          fm[key] = val;
+        }
+      }
+      return {
+        name: fm.name || f.replace(".md", ""),
+        description: fm.description || "",
+        when_to_use: fm.when_to_use || "",
+        body: fmMatch[2].trim(),
+      };
+    })
+    .filter((s): s is SkillFrontmatter => s !== null);
 }
 
-function loadMemberSkill(): string {
-  if (cachedMemberSkill) return cachedMemberSkill;
-  try {
-    cachedMemberSkill = fs.readFileSync(path.join(__dirname, "..", "guides", "member-profiles.md"), "utf-8");
-  } catch {
-    cachedMemberSkill = "";
-  }
-  return cachedMemberSkill;
+let cachedSkillsContext = "";
+
+function loadSkillsContext(): string {
+  if (cachedSkillsContext) return cachedSkillsContext;
+  const skills = loadSkillFiles();
+  if (!skills.length) return "";
+
+  const index = skills
+    .map((s) => `- **${s.name}**: ${s.description}${s.when_to_use ? ` — ${s.when_to_use}` : ""}`)
+    .join("\n");
+
+  const bodies = skills
+    .map((s) => `### ${s.name}\n${s.body}`)
+    .join("\n\n");
+
+  cachedSkillsContext = `[SKILLS]\n${index}\n\n${bodies}`;
+  return cachedSkillsContext;
 }
 
 async function ensureDestinationChannel(message: Message, botName: string): Promise<DestinationChannel> {
@@ -1180,15 +1196,13 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   const prompt = maybeCommand?.query || cleanUserPrompt(message, botUserId);
   const destination = await ensureDestinationChannel(message, profile.name);
   await destination.sendTyping();
-  const skillSnippet = await loadSkillSnippet();
-  const memberSkill = loadMemberSkill();
+  const skillsContext = loadSkillsContext();
   const member = await lookupMember(message.author.id);
   const memberSystemContext = member
     ? formatMemberContext(member)
     : "[MEMBER STATUS] This user is not in the member graph yet. Casually mention `/join` when it naturally fits.";
   const additionalSystemContext = [
-    skillSnippet ? `[SKILL CONTEXT]\n${skillSnippet}` : "",
-    memberSkill ? `[MEMBER SKILL]\n${memberSkill}` : "",
+    skillsContext,
     memberSystemContext
   ]
     .filter(Boolean)
@@ -1449,15 +1463,13 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
     return;
   }
 
-  const skillSnippet = await loadSkillSnippet();
-  const memberSkill = loadMemberSkill();
+  const skillsContext = loadSkillsContext();
   const member = await lookupMember(interaction.user.id);
   const memberSystemContext = member
     ? formatMemberContext(member)
     : "[MEMBER STATUS] This user is not in the member graph yet. Casually mention `/join` when it naturally fits.";
   const additionalSystemContext = [
-    skillSnippet ? `[SKILL CONTEXT]\n${skillSnippet}` : "",
-    memberSkill ? `[MEMBER SKILL]\n${memberSkill}` : "",
+    skillsContext,
     memberSystemContext
   ]
     .filter(Boolean)
@@ -1597,7 +1609,8 @@ async function main(): Promise<void> {
   await mcpGraph.connect();
   const toolDefs = await mcpGraph.getToolDefinitions();
   console.log(`MCP tools cached: ${toolDefs.length} read-only tools available for LLM`);
-  await loadSkillSnippet();
+  const skillsCtx = loadSkillsContext();
+  console.log(`Skills loaded: ${skillsCtx.length} chars`);
   await Promise.all(profiles.map((profile) => startBot(profile)));
   startKickoffServer();
 }
