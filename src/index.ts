@@ -47,6 +47,7 @@ const processedMessageIds = new Set<string>();
 const rateLimitByUser = new Map<string, number>();
 const rateLimitByChannel = new Map<string, number>();
 const activeDebates = new Set<string>();
+const joinInFlight = new Set<string>();
 
 type SchedulingSession = {
   eventType: "paper-club" | "builders-club";
@@ -326,6 +327,29 @@ async function createMemberNodeFromUser(
   });
 }
 
+function isUniqueConstraintError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return /unique|constraint|already exists/i.test(msg);
+}
+
+async function ensureMemberDiscordIndex(): Promise<void> {
+  try {
+    await db.execute({
+      sql:
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_member_discord_id_unique " +
+        "ON nodes(json_extract(metadata, '$.discord_id')) " +
+        "WHERE node_type = 'member' " +
+        "AND json_extract(metadata, '$.discord_id') IS NOT NULL " +
+        "AND json_extract(metadata, '$.discord_id') != ''",
+      args: []
+    });
+    console.log("Member uniqueness index ready: idx_nodes_member_discord_id_unique");
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    console.warn(`Could not create member uniqueness index (continuing): ${msg}`);
+  }
+}
+
 function parseProfileBlock(response: string): {
   clean: string;
   profile: { role?: string; company?: string; location?: string; interests?: string[]; interaction_preference?: string } | null;
@@ -407,13 +431,47 @@ function modelBadge(model: string): string {
 type SkillMeta = {
   name: string;
   description: string;
-  when_to_use: string;
 };
 
+const REQUIRED_SLOP_SKILLS = [
+  "Start Here",
+  "Graph Search",
+  "Member Profiles",
+  "DB Operations",
+  "Curation",
+  "Event Scheduling"
+];
+const REQUIRED_SLOP_SKILL_SET = new Set(REQUIRED_SLOP_SKILLS.map((name) => normalizeSkillName(name)));
+const REQUIRED_SLOP_SKILL_ORDER = new Map(
+  REQUIRED_SLOP_SKILLS.map((name, index) => [normalizeSkillName(name), index] as const)
+);
 const SKILLS_DIR = path.join(__dirname, "..", "skills");
 
-function loadSkillIndex(): SkillMeta[] {
-  if (!fs.existsSync(SKILLS_DIR)) return [];
+function normalizeSkillName(name: string): string {
+  return name.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+}
+
+let cachedSkillsContext = "";
+
+function validateRequiredSlopSkills(skills: SkillMeta[]): void {
+  const slopSet = new Set(skills.map((s) => normalizeSkillName(s.name)));
+
+  const missing = REQUIRED_SLOP_SKILLS.filter((name) => !slopSet.has(normalizeSkillName(name)));
+  const extras = [...slopSet].filter((name) => !REQUIRED_SLOP_SKILL_SET.has(name));
+
+  if (missing.length || extras.length) {
+    const missingText = missing.length ? ` missing=[${missing.join(", ")}]` : "";
+    const extrasText = extras.length ? ` extras=[${extras.join(", ")}]` : "";
+    throw new Error(
+      `Hub Slop skill set mismatch.${missingText}${extrasText} Expected exactly: ${REQUIRED_SLOP_SKILLS.join(", ")}`
+    );
+  }
+}
+
+function loadSkillIndexFromLocal(): SkillMeta[] {
+  if (!fs.existsSync(SKILLS_DIR)) {
+    throw new Error(`Skills directory not found: ${SKILLS_DIR}`);
+  }
   return fs.readdirSync(SKILLS_DIR)
     .filter((f) => f.endsWith(".md"))
     .map((f) => {
@@ -432,36 +490,52 @@ function loadSkillIndex(): SkillMeta[] {
       return {
         name: fm.name || f.replace(".md", ""),
         description: fm.description || "",
-        when_to_use: fm.when_to_use || "",
       };
     })
     .filter((s): s is SkillMeta => s !== null);
 }
 
-function readLocalSkill(name: string): string | null {
-  const slug = name.toLowerCase().replace(/[^a-z0-9-]/g, "-");
-  const filepath = path.join(SKILLS_DIR, `${slug}.md`);
-  if (!fs.existsSync(filepath)) return null;
-  const raw = fs.readFileSync(filepath, "utf-8");
-  const bodyMatch = raw.match(/^---\n[\s\S]*?\n---\n([\s\S]*)$/);
-  return bodyMatch ? bodyMatch[1].trim() : raw;
-}
+function loadSkillsContextFromLocalStrict(): string {
+  const skills = loadSkillIndexFromLocal();
+  validateRequiredSlopSkills(skills);
 
-let cachedSkillsContext = "";
+  const ordered = skills
+    .slice()
+    .sort((a, b) => {
+      const ai = REQUIRED_SLOP_SKILL_ORDER.get(normalizeSkillName(a.name)) ?? Number.MAX_SAFE_INTEGER;
+      const bi = REQUIRED_SLOP_SKILL_ORDER.get(normalizeSkillName(b.name)) ?? Number.MAX_SAFE_INTEGER;
+      if (ai !== bi) return ai - bi;
+      return a.name.localeCompare(b.name);
+    });
 
-function loadSkillsContext(): string {
-  if (cachedSkillsContext) return cachedSkillsContext;
-  const skills = loadSkillIndex();
-  if (!skills.length) return "";
-
-  const lines = skills
-    .map((s) => `- **${s.name}**: ${s.description}${s.when_to_use ? ` | When: ${s.when_to_use}` : ""}`)
+  const lines = ordered
+    .map((s) => `- **${s.name}**: ${s.description}`)
     .join("\n");
 
   cachedSkillsContext = [
-    "[SKILLS] You have the following operational skills. Read the full skill with ls_read_skill(name) when you need detailed instructions.",
+    "[SKILLS] Canonical source: local bot skills directory. Use ls_read_skill(name) for full instructions.",
     lines,
   ].join("\n");
+  return cachedSkillsContext;
+}
+
+function readLocalSkillStrict(name: string): string {
+  const slug = normalizeSkillName(name);
+  const filepath = path.join(SKILLS_DIR, `${slug}.md`);
+  if (!fs.existsSync(filepath)) {
+    throw new Error(`Local skill not found: ${name}`);
+  }
+  const raw = fs.readFileSync(filepath, "utf-8");
+  const bodyMatch = raw.match(/^---\n[\s\S]*?\n---\n([\s\S]*)$/);
+  const content = bodyMatch ? bodyMatch[1].trim() : raw.trim();
+  if (!content) throw new Error(`Local skill is empty: ${name}`);
+  return content;
+}
+
+function getSkillsContextOrThrow(): string {
+  if (!cachedSkillsContext) {
+    throw new Error("Skills context not loaded. Local skills must be loaded at startup.");
+  }
   return cachedSkillsContext;
 }
 
@@ -724,24 +798,9 @@ async function generateAgenticResponse(
       try {
         const args = JSON.parse(tc.function.arguments || "{}");
 
-        // Serve local bot skills first, fall back to MCP
         if (toolName === "ls_read_skill" && typeof args.name === "string") {
           skillsRead.add(args.name);
-          const local = readLocalSkill(args.name);
-          if (local) {
-            resultText = local;
-            mcpGraph.recordTrace({
-              tool: "ls_read_skill",
-              args,
-              result: { source: "local-skill-file", chars: resultText.length },
-              duration_ms: 0
-            });
-          } else {
-            const result = await mcpGraph.callTool(toolName, args);
-            resultText = result.structuredContent
-              ? JSON.stringify(result.structuredContent)
-              : normalizeTextContent(result.content);
-          }
+          resultText = readLocalSkillStrict(args.name);
         } else {
           const result = await mcpGraph.callTool(toolName, args);
           if (result.structuredContent) {
@@ -1287,7 +1346,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   const prompt = cleanUserPrompt(message, botUserId);
   const destination = await ensureDestinationChannel(message, profile.name);
   await destination.sendTyping();
-  const skillsContext = loadSkillsContext();
+  const skillsContext = getSkillsContextOrThrow();
   const member = await lookupMember(message.author.id);
   const memberContext = member
     ? formatMemberContext(member)
@@ -1405,6 +1464,11 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
   await interaction.deferReply();
 
   if (command === "join") {
+    if (joinInFlight.has(interaction.user.id)) {
+      await interaction.editReply("Already processing your `/join` request. Try again in a few seconds.");
+      return;
+    }
+    joinInFlight.add(interaction.user.id);
     try {
       const existing = await lookupMember(interaction.user.id);
       if (existing) {
@@ -1427,16 +1491,44 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
         return;
       }
 
-      const newMember = await createMemberNodeFromUser(interaction.user);
-      const reply = "You're in the graph. As we chat, I'll learn what you're into and connect you to relevant content.";
-      await interaction.editReply(reply);
-      await logTrace(profile, traceSource, "/join", reply, {
-        retrieval_method: "member_create", context_node_ids: [], member_id: newMember.id,
-        is_slash_command: true, slash_command: "join", is_kickoff: false, latency_ms: Date.now() - startTime
-      });
+      try {
+        const newMember = await createMemberNodeFromUser(interaction.user);
+        const reply = "You're in the graph. As we chat, I'll learn what you're into and connect you to relevant content.";
+        await interaction.editReply(reply);
+        await logTrace(profile, traceSource, "/join", reply, {
+          retrieval_method: "member_create", context_node_ids: [], member_id: newMember.id,
+          is_slash_command: true, slash_command: "join", is_kickoff: false, latency_ms: Date.now() - startTime
+        });
+      } catch (createError) {
+        // Handle join races gracefully: if another concurrent request created the member,
+        // treat this as already joined.
+        const raced = await lookupMember(interaction.user.id);
+        if (raced && isUniqueConstraintError(createError)) {
+          const refreshedMetadata: MemberMetadata = {
+            ...raced.metadata,
+            discord_id: interaction.user.id,
+            discord_handle: interaction.user.username,
+            avatar_url: interaction.user.displayAvatarURL({ size: 256, extension: "png" }),
+            last_active: new Date().toISOString()
+          };
+          await mcpGraph.updateMemberNode(raced.id, {
+            metadata: refreshedMetadata as Record<string, unknown>
+          });
+          const reply = `You're already in the graph. I've been tracking your interests since ${raced.metadata.joined_at}.`;
+          await interaction.editReply(reply);
+          await logTrace(profile, traceSource, "/join", reply, {
+            retrieval_method: "member_lookup", context_node_ids: [], member_id: raced.id,
+            is_slash_command: true, slash_command: "join", is_kickoff: false, latency_ms: Date.now() - startTime
+          });
+          return;
+        }
+        throw createError;
+      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       await interaction.editReply(`Couldn't add you to the graph right now: ${msg}`);
+    } finally {
+      joinInFlight.delete(interaction.user.id);
     }
     return;
   }
@@ -1583,10 +1675,11 @@ async function main(): Promise<void> {
   } else {
     console.warn("ALLOWED_CHANNEL_IDS not set. Bots will respond in any channel they can read.");
   }
+  await ensureMemberDiscordIndex();
   await mcpGraph.connect();
   const toolDefs = await mcpGraph.getToolDefinitions();
   console.log(`MCP tools cached: ${toolDefs.length} read-only tools available for LLM`);
-  const skillsCtx = loadSkillsContext();
+  const skillsCtx = loadSkillsContextFromLocalStrict();
   console.log(`Skills loaded: ${skillsCtx.length} chars`);
   await Promise.all(profiles.map((profile) => startBot(profile)));
   startKickoffServer();
