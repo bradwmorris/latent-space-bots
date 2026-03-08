@@ -42,8 +42,6 @@ type KickoffPayload = {
   exchanges?: number;
 };
 
-type ContentNodeType = "podcast" | "article" | "ainews" | "builders-club" | "paper-club" | "workshop";
-
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const processedMessageIds = new Set<string>();
 const rateLimitByUser = new Map<string, number>();
@@ -183,20 +181,6 @@ function shouldRespondToMessage(message: Message, botUserId: string, profileName
   return directlyMentioned || replyToBot;
 }
 
-function parseCommand(content: string): { command: "tldr" | "wassup"; query: string } | null {
-  const trimmed = content.trim();
-  // /wassup can be used with no arguments
-  const wassupMatch = trimmed.match(/^\/wassup\s*$/i);
-  if (wassupMatch) return { command: "wassup", query: "" };
-  // /tldr requires a query, /wassup can optionally have one too
-  const regex = /^\/(tldr|wassup)\s+([\s\S]+)$/i;
-  const match = trimmed.match(regex);
-  if (!match) return null;
-  return {
-    command: match[1].toLowerCase() as "tldr" | "wassup",
-    query: match[2].trim()
-  };
-}
 
 function isAllowedChannel(message: Message): boolean {
   if (!ALLOWED_CHANNEL_IDS.size) return true;
@@ -409,37 +393,6 @@ async function updateMemberAfterInteraction(
   );
 }
 
-async function queryLatestContent(
-  nodeType?: ContentNodeType,
-  limit = 3
-): Promise<{ method: string; text: string; nodeIds: number[] } | null> {
-  const rows = await mcpGraph.queryLatestContent(nodeType, limit);
-  if (!rows.length) return null;
-
-  const nodeIds: number[] = [];
-  const lines = rows.map((row, idx) => {
-    const id = Number(row.id);
-    if (Number.isFinite(id) && id > 0) nodeIds.push(id);
-    const type = String(row.node_type || "unknown");
-    const date = String(row.event_date || "unknown-date");
-    const title = String(row.title || "Untitled");
-    const link = String(row.link || "");
-    const titleLine = link ? `[${title}](${link})` : title;
-    return (
-      `${idx + 1}. [${date}] (${type}) ${titleLine}\n` +
-      `Desc: ${String(row.description || "")}\n` +
-      `Excerpt: ${String(row.excerpt || "")}\n` +
-      `Link: ${link}`
-    );
-  });
-
-  return {
-    method: nodeType ? `latest_node_lookup:${nodeType}` : "latest_node_lookup",
-    text: `Search method: latest_node_lookup\n\n${lines.join("\n\n")}`,
-    nodeIds
-  };
-}
-
 function shortModelName(model: string): string {
   const trimmed = model.trim();
   if (!trimmed) return "unknown-model";
@@ -449,18 +402,6 @@ function shortModelName(model: string): string {
 
 function modelBadge(model: string): string {
   return `🤖 ${shortModelName(model)}`;
-}
-
-function formatToolMethod(method: string): string {
-  if (!method || method === "unknown") return "lookup";
-  if (method === "smalltalk") return "none";
-  if (method.startsWith("latest_node_lookup:")) return `latest:${method.split(":")[1] || "content"}`;
-  if (method === "latest_node_lookup") return "latest:content";
-  return method;
-}
-
-function toolsFooter(method: string): string {
-  return `🛠️ ${formatToolMethod(method)}`;
 }
 
 type SkillMeta = {
@@ -1212,8 +1153,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   const startTime = Date.now();
   const traceSource = { userId: message.author.id, username: message.author.username, channelId: message.channelId, messageId: message.id };
 
-  const maybeCommand = parseCommand(cleanUserPrompt(message, botUserId));
-  const prompt = maybeCommand?.query || cleanUserPrompt(message, botUserId);
+  const prompt = cleanUserPrompt(message, botUserId);
   const destination = await ensureDestinationChannel(message, profile.name);
   await destination.sendTyping();
   const skillsContext = loadSkillsContext();
@@ -1223,41 +1163,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
     : "[MEMBER STATUS] This user is not in the member graph yet. Casually mention `/join` when it naturally fits.";
   const systemPrompt = buildSystemPrompt({ skillsContext, memberContext });
 
-  // /wassup fetches its own context, skip general KB query
-  if (maybeCommand?.command === "wassup") {
-    try {
-      const latest = await queryLatestContent(undefined, 6);
-      const wassupContext = latest?.text || "No recent content found.";
-      const wassupMethod = latest?.method || "latest_node_lookup";
-      const output = await generateResponse(
-        profile,
-        "What's new in Latent Space? Summarize the most interesting recent content — what dropped, why it matters, and what builders should pay attention to.",
-        wassupContext,
-        { systemPrompt }
-      );
-      await destination.send(modelBadge(profile.model));
-      const parts = splitForDiscord(output);
-      for (const part of parts) {
-        await destination.send(part);
-      }
-      await destination.send(toolsFooter(wassupMethod));
-      await logTrace(profile, traceSource, prompt || "/wassup", output, {
-        retrieval_method: wassupMethod,
-        context_node_ids: latest?.nodeIds || [],
-        member_id: member?.id || null,
-        is_slash_command: false,
-        slash_command: "wassup",
-        is_kickoff: false,
-        latency_ms: Date.now() - startTime
-      });
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      await destination.send(`${profile.name} hit an error while generating a response: ${msg}`);
-    }
-    return;
-  }
-
-  const smalltalk = !maybeCommand && isGreetingOrSmalltalk(prompt);
+  const smalltalk = isGreetingOrSmalltalk(prompt);
 
   if (smalltalk) {
     try {
@@ -1299,11 +1205,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
 
   // Agentic path — LLM decides what to search
   try {
-    const effectivePrompt =
-      maybeCommand?.command === "tldr"
-        ? `Give a concise TLDR on: ${prompt}. Stick to what the knowledge base says — key points, why it matters, and link to sources.`
-        : prompt;
-    const { text: rawOutput, toolsUsed } = await generateAgenticResponse(profile, effectivePrompt, { systemPrompt });
+    const { text: rawOutput, toolsUsed } = await generateAgenticResponse(profile, prompt, { systemPrompt });
     const { clean: output, profile: profileUpdate } = parseProfileBlock(rawOutput);
     // Extract node IDs from tool call traces for member edge creation
     const nodeIds = mcpGraph.callTraces
@@ -1325,8 +1227,8 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
       retrieval_method: "agentic",
       context_node_ids: nodeIds,
       member_id: member?.id || null,
-      is_slash_command: !!maybeCommand,
-      slash_command: maybeCommand?.command || null,
+      is_slash_command: false,
+      slash_command: null,
       is_kickoff: false,
       latency_ms: Date.now() - startTime
     });
@@ -1362,7 +1264,7 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
   mcpGraph.clearTraces();
   const startTime = Date.now();
   const traceSource = { userId: interaction.user.id, username: interaction.user.username, channelId: interaction.channelId || "", messageId: interaction.id };
-  const command = interaction.commandName as "tldr" | "wassup" | "join" | "paper-club" | "builders-club";
+  const command = interaction.commandName as "join" | "paper-club" | "builders-club";
   await interaction.deferReply();
 
   if (command === "join") {
@@ -1477,71 +1379,6 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
     }
     return;
   }
-
-  const skillsContext = loadSkillsContext();
-  const member = await lookupMember(interaction.user.id);
-  const memberContext = member
-    ? formatMemberContext(member)
-    : "[MEMBER STATUS] This user is not in the member graph yet. Casually mention `/join` when it naturally fits.";
-  const systemPrompt = buildSystemPrompt({ skillsContext, memberContext });
-
-  if (command === "wassup") {
-    const latest = await queryLatestContent(undefined, 6);
-    const context = latest?.text || "No recent content found.";
-    const contextMethod = latest?.method || "latest_node_lookup";
-    const output = await generateResponse(
-      profile,
-      "What's new in Latent Space? Summarize the most interesting recent content — what dropped, why it matters, and what builders should pay attention to.",
-      context,
-      { systemPrompt }
-    );
-    await interaction.editReply(
-      `${modelBadge(profile.model)}\n\n${output}\n\n${toolsFooter(contextMethod)}`.slice(0, 1900)
-    );
-    await logTrace(profile, traceSource, "/wassup", output, {
-      retrieval_method: contextMethod, context_node_ids: latest?.nodeIds || [], member_id: member?.id || null,
-      is_slash_command: true, slash_command: "wassup", is_kickoff: false, latency_ms: Date.now() - startTime
-    });
-    return;
-  }
-
-  // /tldr — agentic path
-  const query = interaction.options.getString("query", true).trim();
-  const { text: output, toolsUsed } = await generateAgenticResponse(
-    profile,
-    `Give a concise TLDR on: ${query}. Stick to what the knowledge base says — key points, why it matters, and link to sources.`,
-    { systemPrompt }
-  );
-  await interaction.editReply(
-    `${modelBadge(profile.model)}\n\n${output}\n\n${agenticToolsFooter(toolsUsed)}`.slice(0, 1900)
-  );
-  const nodeIds = mcpGraph.callTraces
-    .filter((t) => t.tool === "ls_get_nodes" || t.tool === "ls_search_nodes")
-    .flatMap((t) => {
-      const r = t.result as Record<string, unknown> | null;
-      if (!r) return [];
-      if (Array.isArray(r)) return r.map((n: Record<string, unknown>) => Number(n.id)).filter(Number.isFinite);
-      return [];
-    });
-  await logTrace(profile, traceSource, `/tldr ${query}`, output, {
-    retrieval_method: "agentic", context_node_ids: nodeIds, member_id: member?.id || null,
-    is_slash_command: true, slash_command: "tldr", is_kickoff: false, latency_ms: Date.now() - startTime
-  });
-  if (member) {
-    queueMicrotask(async () => {
-      try {
-        await updateMemberAfterInteraction(
-          member,
-          query,
-          nodeIds,
-          undefined,
-          interaction.user.displayAvatarURL({ size: 256, extension: "png" })
-        );
-      } catch (error) {
-        console.warn("Member update failed (non-blocking):", error);
-      }
-    });
-  }
 }
 
 async function registerSlashCommands(profile: BotProfile): Promise<void> {
@@ -1551,13 +1388,6 @@ async function registerSlashCommands(profile: BotProfile): Promise<void> {
   }
 
   const commands = [
-    new SlashCommandBuilder()
-      .setName("tldr")
-      .setDescription("Get a concise TLDR on any topic from the Latent Space graph")
-      .addStringOption((opt) => opt.setName("query").setDescription("Topic to summarize").setRequired(true)),
-    new SlashCommandBuilder()
-      .setName("wassup")
-      .setDescription("See what's new and interesting in Latent Space"),
     new SlashCommandBuilder()
       .setName("join")
       .setDescription("Add yourself to the Latent Space knowledge graph"),

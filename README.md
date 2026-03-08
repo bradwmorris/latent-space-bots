@@ -7,8 +7,7 @@ Gateway runtime implemented for:
 - Slop primary client (Sig optional — omit `BOT_TOKEN_SIG` to run Slop-only)
 - Mention/reply handling with thread-first replies
 - Single-owner thread routing: if a user tags one bot, that bot owns the thread follow-up conversation
-- Slash commands: `/tldr`, `/wassup`
-- Slash command: `/join` (member profile opt-in)
+- Slash commands: `/join`, `/paper-club`, `/builders-club`
 - MCP-first graph access via `latent-space-hub-mcp` tools
 - Channel allowlist + basic rate limiting
 - Optional chat logging to Turso (`ENABLE_CHAT_LOG_WRITE=true`)
@@ -18,9 +17,9 @@ Gateway runtime implemented for:
 
 | Command | Params | Description |
 |---------|--------|-------------|
-| `/tldr` | `query` (required) | Get a concise TLDR on any topic from the Latent Space graph |
-| `/wassup` | none | See what's new and interesting in Latent Space |
 | `/join` | none | Add yourself as a member node in the Latent Space graph |
+| `/paper-club` | none | Schedule a Paper Club session — pick a date and paper |
+| `/builders-club` | none | Schedule a Builders Club session — pick a date and topic |
 
 ## Member Memory
 
