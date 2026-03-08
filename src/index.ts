@@ -508,13 +508,18 @@ async function generateResponse(
   userPrompt: string,
   context: string,
   options?: { requireSources?: boolean; systemPrompt?: string }
-): Promise<string> {
+): Promise<{ text: string; trace: LlmTrace }> {
   const requireSources = options?.requireSources ?? true;
   const systemContent = options?.systemPrompt || buildSystemPrompt({ skillsContext: "", memberContext: "" });
   const contextNote = requireSources
     ? "Use the supplied context for factual claims. Include a short Sources list with links."
     : "";
-  const payload = {
+  const payload: {
+    model: string;
+    temperature: number;
+    max_tokens: number;
+    messages: OpenRouterMessage[];
+  } = {
     model: profile.model,
     temperature: 0.6,
     max_tokens: 700,
@@ -530,6 +535,7 @@ async function generateResponse(
     ]
   };
 
+  const start = Date.now();
   const response = await fetch(OPENROUTER_URL, {
     method: "POST",
     headers: {
@@ -544,18 +550,42 @@ async function generateResponse(
     throw new Error(`OpenRouter error (${response.status}): ${body.slice(0, 400)}`);
   }
 
-  const data = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
+  const data = (await response.json()) as OpenRouterChatResponse;
   const text = data.choices?.[0]?.message?.content?.trim();
 
   if (!text) {
     throw new Error("OpenRouter returned empty response.");
   }
-  return text;
+
+  return {
+    text,
+    trace: {
+      system_prompt: systemContent,
+      request_messages: payload.messages,
+      request_payload: payload,
+      response_id: data.id,
+      provider: data.provider ?? null,
+      usage: data.usage ?? null,
+      estimated_cost_usd: extractEstimatedCostUsd(data.usage),
+      latency_ms: Date.now() - start,
+      rounds: 1
+    }
+  };
 }
 
-type AgenticResult = { text: string; toolsUsed: string[] };
+type LlmTrace = {
+  system_prompt: string;
+  request_messages: OpenRouterMessage[];
+  request_payload: Record<string, unknown>;
+  response_id?: string;
+  provider?: string | null;
+  usage?: Record<string, unknown> | null;
+  estimated_cost_usd?: number | null;
+  latency_ms: number;
+  rounds: number;
+};
+
+type AgenticResult = { text: string; toolsUsed: string[]; skillsRead: string[]; trace: LlmTrace };
 
 type OpenRouterToolCall = {
   id: string;
@@ -570,6 +600,39 @@ type OpenRouterMessage = {
   tool_call_id?: string;
 };
 
+type OpenRouterChatResponse = {
+  id?: string;
+  provider?: string;
+  usage?: Record<string, unknown>;
+  choices?: Array<{
+    message?: {
+      content?: string | null;
+      tool_calls?: OpenRouterToolCall[];
+      role?: string;
+    };
+    finish_reason?: string;
+  }>;
+};
+
+function extractEstimatedCostUsd(usage: Record<string, unknown> | undefined): number | null {
+  if (!usage) return null;
+  const candidates = [
+    usage.total_cost,
+    usage.cost,
+    usage.estimated_cost,
+    usage.usd_cost,
+    usage.total_cost_usd
+  ];
+  for (const value of candidates) {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return null;
+}
+
 const MAX_AGENTIC_ROUNDS = 5;
 const MAX_TOOL_RESULT_CHARS = 4000;
 
@@ -580,6 +643,7 @@ async function generateAgenticResponse(
 ): Promise<AgenticResult> {
   const systemContent = options?.systemPrompt || buildSystemPrompt({ skillsContext: "", memberContext: "" });
   const tools = await mcpGraph.getToolDefinitions();
+  const start = Date.now();
 
   const messages: OpenRouterMessage[] = [
     {
@@ -590,6 +654,7 @@ async function generateAgenticResponse(
   ];
 
   const toolsUsed: string[] = [];
+  const skillsRead = new Set<string>();
 
   for (let round = 0; round < MAX_AGENTIC_ROUNDS; round++) {
     const payload = {
@@ -614,16 +679,7 @@ async function generateAgenticResponse(
       throw new Error(`OpenRouter error (${response.status}): ${body.slice(0, 400)}`);
     }
 
-    const data = (await response.json()) as {
-      choices?: Array<{
-        message?: {
-          content?: string | null;
-          tool_calls?: OpenRouterToolCall[];
-          role?: string;
-        };
-        finish_reason?: string;
-      }>;
-    };
+    const data = (await response.json()) as OpenRouterChatResponse;
 
     const choice = data.choices?.[0];
     const assistantMsg = choice?.message;
@@ -639,7 +695,25 @@ async function generateAgenticResponse(
     if (!assistantMsg.tool_calls?.length) {
       const text = (assistantMsg.content || "").trim();
       if (!text) throw new Error("OpenRouter returned empty response after tool loop.");
-      return { text, toolsUsed };
+      return {
+        text,
+        toolsUsed,
+        skillsRead: [...skillsRead],
+        trace: {
+          system_prompt: systemContent,
+          request_messages: payload.messages,
+          request_payload: {
+            ...payload,
+            tools: tools.map((t) => t.function.name)
+          },
+          response_id: data.id,
+          provider: data.provider ?? null,
+          usage: data.usage ?? null,
+          estimated_cost_usd: extractEstimatedCostUsd(data.usage),
+          latency_ms: Date.now() - start,
+          rounds: round + 1
+        }
+      };
     }
 
     // Execute each tool call
@@ -652,9 +726,16 @@ async function generateAgenticResponse(
 
         // Serve local bot skills first, fall back to MCP
         if (toolName === "ls_read_skill" && typeof args.name === "string") {
+          skillsRead.add(args.name);
           const local = readLocalSkill(args.name);
           if (local) {
             resultText = local;
+            mcpGraph.recordTrace({
+              tool: "ls_read_skill",
+              args,
+              result: { source: "local-skill-file", chars: resultText.length },
+              duration_ms: 0
+            });
           } else {
             const result = await mcpGraph.callTool(toolName, args);
             resultText = result.structuredContent
@@ -711,11 +792,29 @@ async function generateAgenticResponse(
   }
 
   const finalData = (await finalResponse.json()) as {
+    id?: string;
+    provider?: string;
+    usage?: Record<string, unknown>;
     choices?: Array<{ message?: { content?: string } }>;
   };
   const text = finalData.choices?.[0]?.message?.content?.trim();
   if (!text) throw new Error("OpenRouter returned empty response on final round.");
-  return { text, toolsUsed };
+  return {
+    text,
+    toolsUsed,
+    skillsRead: [...skillsRead],
+    trace: {
+      system_prompt: systemContent,
+      request_messages: finalPayload.messages,
+      request_payload: finalPayload,
+      response_id: finalData.id,
+      provider: finalData.provider ?? null,
+      usage: finalData.usage ?? null,
+      estimated_cost_usd: extractEstimatedCostUsd(finalData.usage),
+      latency_ms: Date.now() - start,
+      rounds: MAX_AGENTIC_ROUNDS + 1
+    }
+  };
 }
 
 function agenticToolsFooter(toolsUsed: string[]): string {
@@ -740,7 +839,26 @@ type TraceOptions = {
   slash_command: string | null;
   is_kickoff: boolean;
   latency_ms: number;
+  interaction_kind?: string;
+  tools_used?: string[];
+  skills_used?: string[];
+  llm_trace?: LlmTrace | null;
 };
+
+function inferInteractionKind(options: TraceOptions): string {
+  if (options.interaction_kind) return options.interaction_kind;
+  if (options.is_kickoff) return "Kickoff post from newly ingested content";
+  if (options.is_slash_command) {
+    if (options.slash_command === "join") return "Slash command: member onboarding";
+    if (options.slash_command === "paper-club") return "Slash command: schedule paper club event";
+    if (options.slash_command === "builders-club") return "Slash command: schedule builders club event";
+    return "Slash command interaction";
+  }
+  if (options.retrieval_method === "smalltalk") return "Thread chat / small talk";
+  if (options.retrieval_method === "agentic") return "Thread user request answered with agentic retrieval";
+  if (options.retrieval_method === "event_create") return "Event scheduling workflow";
+  return "Discord interaction";
+}
 
 async function logTrace(
   profile: BotProfile,
@@ -752,12 +870,15 @@ async function logTrace(
   try {
     const toolCalls: ToolTrace[] = mcpGraph.clearTraces();
     const metadata = {
+      interaction_kind: inferInteractionKind(options),
       discord_user_id: source.userId,
       discord_username: source.username,
       discord_channel_id: source.channelId,
       discord_message_id: source.messageId,
       retrieval_method: options.retrieval_method,
       context_node_ids: options.context_node_ids,
+      tools_used: options.tools_used || toolCalls.map((t) => t.tool),
+      skills_used: options.skills_used || [],
       tool_calls: toolCalls,
       member_id: options.member_id,
       model: profile.model,
@@ -765,7 +886,14 @@ async function logTrace(
       slash_command: options.slash_command,
       is_kickoff: options.is_kickoff,
       response_length: response.length,
-      latency_ms: options.latency_ms
+      latency_ms: options.latency_ms,
+      system_message: options.llm_trace?.system_prompt || null,
+      llm_messages: options.llm_trace?.request_messages || null,
+      llm_request_payload: options.llm_trace?.request_payload || null,
+      openrouter_response_id: options.llm_trace?.response_id || null,
+      openrouter_provider: options.llm_trace?.provider || null,
+      openrouter_usage: options.llm_trace?.usage || null,
+      estimated_cost_usd: options.llm_trace?.estimated_cost_usd ?? null
     };
 
     await db.execute({
@@ -893,7 +1021,7 @@ async function runDeterministicKickoff(payload: KickoffPayload): Promise<{ ok: t
       .filter(Boolean)
       .join("\n");
 
-    const { text: output, toolsUsed } = await generateAgenticResponse(slopProfile, slopPrompt);
+    const { text: output, toolsUsed, skillsRead, trace } = await generateAgenticResponse(slopProfile, slopPrompt);
     await destination.send(`${modelBadge(slopProfile.model)}\n${output}`);
     await destination.send(agenticToolsFooter(toolsUsed));
 
@@ -911,7 +1039,10 @@ async function runDeterministicKickoff(payload: KickoffPayload): Promise<{ ok: t
       is_slash_command: false,
       slash_command: null,
       is_kickoff: true,
-      latency_ms: Date.now() - startTime
+      latency_ms: Date.now() - startTime,
+      tools_used: toolsUsed,
+      skills_used: skillsRead,
+      llm_trace: trace
     });
   } finally {
     activeDebates.delete(kickoffKey);
@@ -1167,7 +1298,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
 
   if (smalltalk) {
     try {
-      const rawOutput = await generateResponse(profile, prompt, "No graph retrieval needed for greeting/smalltalk.", {
+      const { text: rawOutput, trace } = await generateResponse(profile, prompt, "No graph retrieval needed for greeting/smalltalk.", {
         requireSources: false,
         systemPrompt
       });
@@ -1185,7 +1316,10 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
         is_slash_command: false,
         slash_command: null,
         is_kickoff: false,
-        latency_ms: Date.now() - startTime
+        latency_ms: Date.now() - startTime,
+        tools_used: [],
+        skills_used: [],
+        llm_trace: trace
       });
       if (member && profileUpdate) {
         queueMicrotask(async () => {
@@ -1205,7 +1339,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
 
   // Agentic path — LLM decides what to search
   try {
-    const { text: rawOutput, toolsUsed } = await generateAgenticResponse(profile, prompt, { systemPrompt });
+    const { text: rawOutput, toolsUsed, skillsRead, trace } = await generateAgenticResponse(profile, prompt, { systemPrompt });
     const { clean: output, profile: profileUpdate } = parseProfileBlock(rawOutput);
     // Extract node IDs from tool call traces for member edge creation
     const nodeIds = mcpGraph.callTraces
@@ -1230,7 +1364,10 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
       is_slash_command: false,
       slash_command: null,
       is_kickoff: false,
-      latency_ms: Date.now() - startTime
+      latency_ms: Date.now() - startTime,
+      tools_used: toolsUsed,
+      skills_used: skillsRead,
+      llm_trace: trace
     });
     if (member) {
       queueMicrotask(async () => {

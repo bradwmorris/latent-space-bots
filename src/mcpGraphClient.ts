@@ -86,6 +86,10 @@ export class McpGraphClient {
     return traces;
   }
 
+  recordTrace(trace: ToolTrace): void {
+    this.callTraces.push(trace);
+  }
+
   async getToolDefinitions(): Promise<OpenAIToolDef[]> {
     if (this.cachedToolDefs) return this.cachedToolDefs;
     const client = this.ensureClient();
