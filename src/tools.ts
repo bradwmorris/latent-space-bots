@@ -5,6 +5,7 @@
  * functions and the tool loop executes them via direct Turso queries.
  */
 import type { Client as LibsqlClient } from "@libsql/client";
+import { OPENAI_API_KEY } from "./config";
 import * as dbOps from "./db";
 
 // ── OpenAI function calling types ──────────────────────────────
@@ -21,18 +22,35 @@ export type ToolHandler = {
 // ── Tool definitions (what the LLM sees) ───────────────────────
 
 export const TOOL_DEFINITIONS: OpenAIToolDef[] = [
+  // ── Search tools (3) ────────────────────────────────────────
+  {
+    type: "function",
+    function: {
+      name: "slop_semantic_search",
+      description:
+        "Search by meaning using vector embeddings. Finds content even when exact words don't match: 'infrastructure investment' finds 'capex spending'. Default search tool for natural language questions. Searches both node descriptions and transcript/article passages, returns fused results.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Natural language search query" },
+          limit: { type: "number", description: "Max results (default 8, max 20)" },
+        },
+        required: ["query"],
+      },
+    },
+  },
   {
     type: "function",
     function: {
       name: "slop_search_nodes",
       description:
-        "Search nodes in the knowledge graph by title, description, or notes. Supports optional node_type filter. Returns matching nodes sorted by relevance.",
+        "Keyword substring search on node titles, descriptions, and notes (SQL LIKE). Does NOT understand meaning. Use for known names, exact terms, or browsing by node_type. Returns node metadata but not transcript text.",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "Search query text" },
+          query: { type: "string", description: "Exact keyword or name to match" },
           limit: { type: "number", description: "Max results (default 10, max 25)" },
-          node_type: { type: "string", description: "Optional: filter by node type (podcast, article, ainews, guest, entity, member, event, workshop, paper-club, builders-club)" },
+          node_type: { type: "string", description: "Filter by type: podcast, article, ainews, guest, entity, member, event, workshop, paper-club, builders-club" },
         },
         required: ["query"],
       },
@@ -43,29 +61,30 @@ export const TOOL_DEFINITIONS: OpenAIToolDef[] = [
     function: {
       name: "slop_search_content",
       description:
-        "Search through transcript/article text chunks using FTS5 full-text search. Use this for specific quotes, passages, or deep content searches.",
+        "Keyword search through transcript and article text using full-text indexing (FTS5). Matches exact words only, not meaning. Use for specific quotes, technical terms, or phrases you expect to appear verbatim in content.",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "Search query text" },
+          query: { type: "string", description: "Keywords or phrase to find in transcripts/articles" },
           limit: { type: "number", description: "Max results (default 10, max 25)" },
         },
         required: ["query"],
       },
     },
   },
+  // ── Graph traversal tools (3) ───────────────────────────────
   {
     type: "function",
     function: {
       name: "slop_get_nodes",
-      description: "Get full node records by their IDs. Use after search to load complete details.",
+      description: "Load full node records by ID. Use after search to get complete details (notes, metadata, link, description).",
       parameters: {
         type: "object",
         properties: {
           nodeIds: {
             type: "array",
             items: { type: "number" },
-            description: "Array of node IDs to retrieve (max 10)",
+            description: "Node IDs to retrieve (max 10)",
           },
         },
         required: ["nodeIds"],
@@ -76,12 +95,12 @@ export const TOOL_DEFINITIONS: OpenAIToolDef[] = [
     type: "function",
     function: {
       name: "slop_query_edges",
-      description: "Get edges (connections) for a node. Returns connected nodes with relationship context.",
+      description: "Get connections for a node. Returns linked nodes with relationship type and explanation. Use to find who appeared in an episode, what topics a guest covers, etc.",
       parameters: {
         type: "object",
         properties: {
-          nodeId: { type: "number", description: "The node ID to query edges for" },
-          limit: { type: "number", description: "Max edges to return (default 25)" },
+          nodeId: { type: "number", description: "Node ID to get connections for" },
+          limit: { type: "number", description: "Max edges (default 25)" },
         },
         required: ["nodeId"],
       },
@@ -91,15 +110,16 @@ export const TOOL_DEFINITIONS: OpenAIToolDef[] = [
     type: "function",
     function: {
       name: "slop_list_dimensions",
-      description: "List all priority dimensions (categories) in the knowledge graph with their node counts.",
+      description: "List all priority dimensions (categories) with node counts.",
       parameters: { type: "object", properties: {} },
     },
   },
+  // ── Utility tools (3) ───────────────────────────────────────
   {
     type: "function",
     function: {
       name: "slop_get_context",
-      description: "Get knowledge graph stats: total nodes, edges, and chunks counts.",
+      description: "Get wiki-base stats: total nodes, edges, and chunks.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -108,7 +128,7 @@ export const TOOL_DEFINITIONS: OpenAIToolDef[] = [
     function: {
       name: "slop_sqlite_query",
       description:
-        "Run a read-only SQL query against the knowledge graph database. Only SELECT, WITH, and PRAGMA statements allowed. Use for complex queries, aggregations, date-range filters, etc.",
+        "Run read-only SQL (SELECT/WITH/PRAGMA). Use for date-range filters, aggregations, counting, and queries the other tools can't express.",
       parameters: {
         type: "object",
         properties: {
@@ -122,11 +142,11 @@ export const TOOL_DEFINITIONS: OpenAIToolDef[] = [
     type: "function",
     function: {
       name: "slop_read_skill",
-      description: "Read a skill by name. Returns the full markdown content with instructions.",
+      description: "Read a skill by name. Returns full markdown content with instructions.",
       parameters: {
         type: "object",
         properties: {
-          name: { type: "string", description: "Skill name to read" },
+          name: { type: "string", description: "Skill name (e.g. 'db-operations', 'event-scheduling')" },
         },
         required: ["name"],
       },
@@ -137,6 +157,21 @@ export const TOOL_DEFINITIONS: OpenAIToolDef[] = [
 // ── Tool handlers (what executes when the LLM calls a tool) ────
 
 export const TOOL_HANDLERS: Record<string, ToolHandler> = {
+  slop_semantic_search: {
+    execute: async (args, db) => {
+      const query = String(args.query || "");
+      const limit = Math.min(Math.max(Number(args.limit) || 8, 1), 20);
+      const result = await dbOps.semanticSearch(db, query, OPENAI_API_KEY, limit);
+      if (result.method === "unavailable") {
+        return JSON.stringify({ error: "Semantic search unavailable (no embedding API key). Use slop_search_nodes or slop_search_content instead." });
+      }
+      if (result.method === "embedding_failed") {
+        return JSON.stringify({ error: "Failed to generate query embedding. Use slop_search_nodes or slop_search_content instead." });
+      }
+      return JSON.stringify({ method: result.method, results: result.results, count: result.results.length });
+    },
+  },
+
   slop_search_nodes: {
     execute: async (args, db) => {
       const query = String(args.query || "");

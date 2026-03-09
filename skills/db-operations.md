@@ -38,12 +38,17 @@ Entity types (sort by edge count descending):
 
 ## Search Strategy
 
-1. Start with `slop_search_nodes` for most queries. Supports `node_type` filter.
-2. Use `slop_search_content` for specific quotes, passages, or deep transcript searches.
-3. Use `slop_get_nodes` to load full records by ID after finding matches.
-4. Use `slop_sqlite_query` for "latest", counting, or date-range queries (`ORDER BY event_date DESC`).
-5. Use `slop_query_edges` to traverse connections from a node.
-6. If the first search misses, retry with different keywords and/or content search.
+Three search tools, each works differently:
+
+| Tool | How it works | Best for |
+|------|-------------|----------|
+| `slop_semantic_search` | Vector embeddings (meaning) | Natural language questions, conceptual queries. Default choice. |
+| `slop_search_nodes` | Substring matching (SQL LIKE) | Known names, exact terms, filtering by node_type. |
+| `slop_search_content` | Keyword index (FTS5) | Exact words/phrases in transcripts and articles. |
+
+**After finding results:** `slop_get_nodes` for full records, `slop_query_edges` for connections, `slop_sqlite_query` for date filters or aggregations.
+
+If semantic search misses, try keyword tools with specific terms. If keyword tools miss, try semantic search with a rephrased question.
 
 ### Temporal queries
 Use `slop_sqlite_query` for date-aware searches:

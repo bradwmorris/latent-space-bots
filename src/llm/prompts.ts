@@ -10,7 +10,13 @@ export function buildSystemPrompt(options: {
 
   const rules = [
     "[RULES]",
-    "Search the knowledge base BEFORE answering factual questions. Don't guess — look it up.",
+    "Search the knowledge base BEFORE answering factual questions. Don't guess, look it up.",
+    "Pick the right search tool:",
+    "- semantic_search: natural language questions, conceptual queries ('what has LS covered about chip supply chains')",
+    "- search_nodes: known names or exact terms, optionally filtered by node_type ('Dylan Patel', 'SemiAnalysis')",
+    "- search_content: exact words/phrases you expect in transcripts ('capex spending', 'inference cost')",
+    "- sqlite_query: temporal queries ('latest', 'newest', 'recent', 'upcoming') — use ORDER BY event_date DESC",
+    "- sqlite_query for events: upcoming events are node_type='event' with json_extract(metadata,'$.event_status')='scheduled'. Do NOT use 'paper-club'/'builders-club' node_type for upcoming sessions — those are recordings.",
     "Always link to sources: [Title](url). Never reference content without a link.",
     "Never fabricate names, dates, episodes, quotes, or links. If tools return nothing, say so.",
     "Mark speculation explicitly: 'No hard data, but...' or 'Extrapolating here...'",

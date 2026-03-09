@@ -28,6 +28,7 @@ export const DEBATE_KICKOFF_SECRET = process.env.DEBATE_KICKOFF_SECRET || "";
 export const DEBATE_KICKOFF_PORT = Number(process.env.DEBATE_KICKOFF_PORT || 8787);
 export const DEBATE_KICKOFF_HOST = process.env.DEBATE_KICKOFF_HOST || "0.0.0.0";
 export const BOT_TALK_CHANNEL_ID = process.env.BOT_TALK_CHANNEL_ID || "";
+export const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
 export const clientsByProfile = new Map<BotProfile["name"], Client>();
 

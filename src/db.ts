@@ -410,6 +410,170 @@ export async function sqliteQuery(
   return result.rows as unknown as Array<Record<string, unknown>>;
 }
 
+// ── Semantic search (vector) ──────────────────────────────────
+
+type SemanticHit = {
+  node_id: number;
+  title: string;
+  description: string;
+  text: string;
+  link: string;
+  event_date: string;
+  score: number;
+  source: "node_vector" | "chunk_vector" | "fts" | "fused";
+};
+
+function vectorToJsonString(vector: number[]): string {
+  return `[${vector.join(",")}]`;
+}
+
+async function embedQuery(
+  query: string,
+  apiKey: string,
+  model = "text-embedding-3-small"
+): Promise<number[] | null> {
+  try {
+    const response = await fetch("https://api.openai.com/v1/embeddings", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model, input: query }),
+    });
+    if (!response.ok) return null;
+    const json = (await response.json()) as {
+      data?: Array<{ embedding?: number[] }>;
+    };
+    return json.data?.[0]?.embedding ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function vectorSearchNodes(
+  db: LibsqlClient,
+  embedding: number[],
+  limit: number
+): Promise<SemanticHit[]> {
+  const vecJson = vectorToJsonString(embedding);
+  const result = await db.execute({
+    sql: `SELECT n.id AS node_id, n.title,
+                 coalesce(n.description, '') AS description,
+                 substr(coalesce(n.notes, ''), 1, 500) AS text,
+                 coalesce(n.link, '') AS link,
+                 coalesce(n.event_date, '') AS event_date,
+                 (1.0 - vector_distance_cos(n.embedding_vec, vector(?))) AS score
+          FROM vector_top_k('nodes_embedding_idx', vector(?), ?) AS vt
+          JOIN nodes n ON n.rowid = vt.id
+          ORDER BY score DESC`,
+    args: [vecJson, vecJson, limit],
+  });
+  return result.rows.map((row) => ({
+    node_id: Number(row.node_id),
+    title: String(row.title || ""),
+    description: String(row.description || ""),
+    text: String(row.text || ""),
+    link: String(row.link || ""),
+    event_date: String(row.event_date || ""),
+    score: Number(row.score || 0),
+    source: "node_vector" as const,
+  }));
+}
+
+async function vectorSearchChunks(
+  db: LibsqlClient,
+  embedding: number[],
+  limit: number
+): Promise<SemanticHit[]> {
+  const vecJson = vectorToJsonString(embedding);
+  const result = await db.execute({
+    sql: `SELECT n.id AS node_id, n.title,
+                 coalesce(n.description, '') AS description,
+                 substr(c.text, 1, 500) AS text,
+                 coalesce(n.link, '') AS link,
+                 coalesce(n.event_date, '') AS event_date,
+                 (1.0 - vector_distance_cos(c.embedding, vector(?))) AS score
+          FROM vector_top_k('chunks_embedding_idx', vector(?), ?) AS vt
+          JOIN chunks c ON c.rowid = vt.id
+          JOIN nodes n ON n.id = c.node_id
+          ORDER BY score DESC`,
+    args: [vecJson, vecJson, limit],
+  });
+  return result.rows.map((row) => ({
+    node_id: Number(row.node_id),
+    title: String(row.title || ""),
+    description: String(row.description || ""),
+    text: String(row.text || ""),
+    link: String(row.link || ""),
+    event_date: String(row.event_date || ""),
+    score: Number(row.score || 0),
+    source: "chunk_vector" as const,
+  }));
+}
+
+function fuseResults(
+  nodeHits: SemanticHit[],
+  chunkHits: SemanticHit[],
+  maxResults: number
+): SemanticHit[] {
+  const k = 60;
+  const map = new Map<string, { score: number; hit: SemanticHit }>();
+
+  // Key by node_id + text snippet to preserve distinct passages
+  nodeHits.forEach((hit, idx) => {
+    const key = `n:${hit.node_id}`;
+    map.set(key, { score: 1 / (k + idx + 1), hit });
+  });
+
+  chunkHits.forEach((hit, idx) => {
+    const key = `c:${hit.node_id}:${hit.text.slice(0, 50)}`;
+    const rrf = 1 / (k + idx + 1);
+    // Boost if same node appeared in node-level results
+    const nodeKey = `n:${hit.node_id}`;
+    const existing = map.get(nodeKey);
+    if (existing) {
+      existing.score += rrf;
+      // Keep chunk text (more specific) if it's longer
+      if (hit.text.length > existing.hit.text.length) {
+        existing.hit = { ...hit, source: "fused" };
+      }
+    } else {
+      map.set(key, { score: rrf, hit });
+    }
+  });
+
+  return [...map.values()]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, maxResults)
+    .map((e) => ({ ...e.hit, score: e.score }));
+}
+
+export async function semanticSearch(
+  db: LibsqlClient,
+  query: string,
+  openAiApiKey: string,
+  limit: number
+): Promise<{ method: string; results: SemanticHit[] }> {
+  if (!openAiApiKey) {
+    return { method: "unavailable", results: [] };
+  }
+
+  const embedding = await embedQuery(query, openAiApiKey);
+  if (!embedding) {
+    return { method: "embedding_failed", results: [] };
+  }
+
+  const fetchCount = limit * 2;
+  const [nodeHits, chunkHits] = await Promise.all([
+    vectorSearchNodes(db, embedding, fetchCount).catch(() => []),
+    vectorSearchChunks(db, embedding, fetchCount).catch(() => []),
+  ]);
+
+  const fused = fuseResults(nodeHits, chunkHits, limit);
+  return { method: "semantic", results: fused };
+}
+
 // ── Helpers ────────────────────────────────────────────────────
 
 function parseMetadata(raw: unknown): unknown {
