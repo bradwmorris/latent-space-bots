@@ -1,0 +1,438 @@
+/**
+ * Direct Turso database layer for Slop.
+ *
+ * Replaces McpGraphClient — all graph operations now go through
+ * parameterized SQL queries against the shared Turso database.
+ */
+import type { Client as LibsqlClient } from "@libsql/client";
+
+// ── Types ──────────────────────────────────────────────────────
+
+export type NodeRow = {
+  id: number;
+  title: string;
+  notes?: string | null;
+  description?: string | null;
+  link?: string | null;
+  node_type?: string | null;
+  event_date?: string | null;
+  metadata?: unknown;
+};
+
+type EdgeContext = {
+  type: string;
+  confidence: number;
+  inferred_at: string;
+  explanation: string;
+  created_via: string;
+};
+
+// ── Member operations ──────────────────────────────────────────
+
+export async function lookupMemberByDiscordId(
+  db: LibsqlClient,
+  discordId: string
+): Promise<NodeRow | null> {
+  const result = await db.execute({
+    sql: `SELECT id, title, notes, metadata, node_type, event_date, updated_at
+          FROM nodes
+          WHERE node_type = 'member'
+            AND json_extract(metadata, '$.discord_id') = ?
+          ORDER BY updated_at DESC
+          LIMIT 1`,
+    args: [discordId],
+  });
+  if (!result.rows.length) return null;
+  const row = result.rows[0];
+  return {
+    id: Number(row.id),
+    title: String(row.title || ""),
+    notes: row.notes == null ? null : String(row.notes),
+    node_type: row.node_type == null ? null : String(row.node_type),
+    event_date: row.event_date == null ? null : String(row.event_date),
+    metadata: parseMetadata(row.metadata),
+  };
+}
+
+export async function createMemberNode(
+  db: LibsqlClient,
+  payload: { title: string; description?: string; metadata: Record<string, unknown> }
+): Promise<{ id: number }> {
+  const now = new Date().toISOString();
+  const result = await db.execute({
+    sql: `INSERT INTO nodes (title, description, node_type, metadata, created_at, updated_at)
+          VALUES (?, ?, 'member', ?, ?, ?)`,
+    args: [payload.title, payload.description ?? null, JSON.stringify(payload.metadata), now, now],
+  });
+
+  const nodeId = Number(result.lastInsertRowid);
+  if (!Number.isFinite(nodeId) || nodeId <= 0) {
+    throw new Error("INSERT did not return a valid node ID.");
+  }
+
+  // Assign 'member' dimension
+  await db.execute({
+    sql: `INSERT OR IGNORE INTO node_dimensions (node_id, dimension) VALUES (?, 'member')`,
+    args: [nodeId],
+  });
+
+  return { id: nodeId };
+}
+
+export async function updateMemberNode(
+  db: LibsqlClient,
+  nodeId: number,
+  updates: { content?: string; metadata: Record<string, unknown> }
+): Promise<void> {
+  const now = new Date().toISOString();
+  if (updates.content) {
+    await db.execute({
+      sql: `UPDATE nodes SET notes = ?, metadata = ?, updated_at = ? WHERE id = ?`,
+      args: [updates.content, JSON.stringify(updates.metadata), now, nodeId],
+    });
+  } else {
+    await db.execute({
+      sql: `UPDATE nodes SET metadata = ?, updated_at = ? WHERE id = ?`,
+      args: [JSON.stringify(updates.metadata), now, nodeId],
+    });
+  }
+}
+
+// ── Event operations ───────────────────────────────────────────
+
+export async function createEventNode(
+  db: LibsqlClient,
+  payload: {
+    title: string;
+    description?: string;
+    event_date: string;
+    event_type: "paper-club" | "builders-club";
+    presenter_name: string;
+    presenter_discord_id?: string;
+    presenter_node_id?: number;
+    paper_url?: string;
+    paper_title?: string;
+    topic?: string;
+  }
+): Promise<{ id: number }> {
+  const now = new Date().toISOString();
+  const metadata = {
+    event_status: "scheduled",
+    event_type: payload.event_type,
+    presenter_name: payload.presenter_name,
+    presenter_discord_id: payload.presenter_discord_id,
+    presenter_node_id: payload.presenter_node_id,
+    paper_url: payload.paper_url,
+    paper_title: payload.paper_title,
+    topic: payload.topic,
+    scheduled_at: now,
+  };
+
+  const result = await db.execute({
+    sql: `INSERT INTO nodes (title, description, node_type, event_date, metadata, created_at, updated_at)
+          VALUES (?, ?, 'event', ?, ?, ?, ?)`,
+    args: [payload.title, payload.description ?? null, payload.event_date, JSON.stringify(metadata), now, now],
+  });
+
+  const nodeId = Number(result.lastInsertRowid);
+  if (!Number.isFinite(nodeId) || nodeId <= 0) {
+    throw new Error("INSERT did not return a valid event node ID.");
+  }
+
+  // Assign dimensions: 'event' + event_type
+  await db.execute({
+    sql: `INSERT OR IGNORE INTO node_dimensions (node_id, dimension) VALUES (?, 'event')`,
+    args: [nodeId],
+  });
+  await db.execute({
+    sql: `INSERT OR IGNORE INTO node_dimensions (node_id, dimension) VALUES (?, ?)`,
+    args: [nodeId, payload.event_type],
+  });
+
+  return { id: nodeId };
+}
+
+export async function getBookedDates(
+  db: LibsqlClient,
+  eventType: string,
+  dates: string[]
+): Promise<Map<string, string>> {
+  if (!dates.length) return new Map();
+  const placeholders = dates.map(() => "?").join(", ");
+  const result = await db.execute({
+    sql: `SELECT event_date, json_extract(metadata, '$.presenter_name') AS presenter
+          FROM nodes
+          WHERE node_type = 'event'
+            AND json_extract(metadata, '$.event_type') = ?
+            AND json_extract(metadata, '$.event_status') = 'scheduled'
+            AND event_date IN (${placeholders})`,
+    args: [eventType, ...dates],
+  });
+  const map = new Map<string, string>();
+  for (const row of result.rows) {
+    map.set(String(row.event_date), String(row.presenter || "someone"));
+  }
+  return map;
+}
+
+export async function checkEventSlot(
+  db: LibsqlClient,
+  eventType: string,
+  date: string
+): Promise<{ id: number; title: string; presenter: string } | null> {
+  const result = await db.execute({
+    sql: `SELECT id, title, json_extract(metadata, '$.presenter_name') AS presenter
+          FROM nodes
+          WHERE node_type = 'event'
+            AND json_extract(metadata, '$.event_type') = ?
+            AND json_extract(metadata, '$.event_status') = 'scheduled'
+            AND event_date = ?
+          LIMIT 1`,
+    args: [eventType, date],
+  });
+  if (!result.rows.length) return null;
+  const row = result.rows[0];
+  return {
+    id: Number(row.id),
+    title: String(row.title || ""),
+    presenter: String(row.presenter || "unknown"),
+  };
+}
+
+// ── Edge operations ────────────────────────────────────────────
+
+export async function createEdge(
+  db: LibsqlClient,
+  sourceId: number,
+  targetId: number,
+  explanation: string
+): Promise<void> {
+  const now = new Date().toISOString();
+  const context: EdgeContext = {
+    type: "related",
+    confidence: 0.8,
+    inferred_at: now,
+    explanation,
+    created_via: "discord-bot",
+  };
+  await db.execute({
+    sql: `INSERT INTO edges (from_node_id, to_node_id, context, source, created_at)
+          VALUES (?, ?, ?, 'discord-bot', ?)`,
+    args: [sourceId, targetId, JSON.stringify(context), now],
+  });
+}
+
+// ── Search operations (LLM tool handlers) ──────────────────────
+
+export async function searchNodes(
+  db: LibsqlClient,
+  query: string,
+  limit: number,
+  nodeType?: string
+): Promise<NodeRow[]> {
+  const searchTerm = `%${query}%`;
+  let sql = `
+    SELECT n.id, n.title, n.description, n.notes, n.link, n.node_type, n.event_date, n.metadata,
+           COALESCE((SELECT JSON_GROUP_ARRAY(d.dimension)
+                     FROM node_dimensions d WHERE d.node_id = n.id), '[]') as dimensions_json,
+           (SELECT COUNT(*) FROM edges WHERE from_node_id = n.id OR to_node_id = n.id) as edge_count
+    FROM nodes n
+    WHERE (n.title LIKE ? COLLATE NOCASE OR n.description LIKE ? COLLATE NOCASE OR n.notes LIKE ? COLLATE NOCASE)
+  `;
+  const args: (string | number)[] = [searchTerm, searchTerm, searchTerm];
+
+  if (nodeType) {
+    sql += ` AND n.node_type = ?`;
+    args.push(nodeType);
+  }
+
+  sql += `
+    ORDER BY
+      CASE WHEN LOWER(n.title) = LOWER(?) THEN 1 ELSE 6 END,
+      CASE WHEN LOWER(n.title) LIKE LOWER(?) THEN 2 ELSE 6 END,
+      CASE WHEN n.title LIKE ? COLLATE NOCASE THEN 3 ELSE 6 END,
+      CASE WHEN n.description LIKE ? COLLATE NOCASE THEN 4 ELSE 6 END,
+      CASE WHEN n.notes LIKE ? COLLATE NOCASE THEN 5 ELSE 6 END,
+      n.updated_at DESC
+    LIMIT ?
+  `;
+  args.push(query, `${query}%`, searchTerm, searchTerm, searchTerm, limit);
+
+  const result = await db.execute({ sql, args });
+  return result.rows.map(rowToNode);
+}
+
+export async function searchContent(
+  db: LibsqlClient,
+  query: string,
+  limit: number
+): Promise<Array<{ node_id: number; title: string; text: string }>> {
+  // FTS5 search on chunks
+  const ftsQuery = query
+    .replace(/['"]/g, "")
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((term) => `"${term}"`)
+    .join(" ");
+
+  try {
+    const result = await db.execute({
+      sql: `SELECT c.node_id, n.title, c.text, bm25(chunks_fts) as rank_score
+            FROM chunks_fts fts
+            JOIN chunks c ON c.rowid = fts.rowid
+            JOIN nodes n ON n.id = c.node_id
+            WHERE chunks_fts MATCH ?
+            ORDER BY rank_score ASC
+            LIMIT ?`,
+      args: [ftsQuery, limit],
+    });
+    return result.rows.map((row) => ({
+      node_id: Number(row.node_id),
+      title: String(row.title || ""),
+      text: String(row.text || ""),
+    }));
+  } catch {
+    // FTS5 fallback: LIKE search
+    const result = await db.execute({
+      sql: `SELECT c.node_id, n.title, c.text
+            FROM chunks c
+            JOIN nodes n ON n.id = c.node_id
+            WHERE LOWER(c.text) LIKE ?
+            ORDER BY LENGTH(c.text) ASC
+            LIMIT ?`,
+      args: [`%${query.toLowerCase()}%`, limit],
+    });
+    return result.rows.map((row) => ({
+      node_id: Number(row.node_id),
+      title: String(row.title || ""),
+      text: String(row.text || ""),
+    }));
+  }
+}
+
+export async function getNodesById(
+  db: LibsqlClient,
+  nodeIds: number[]
+): Promise<NodeRow[]> {
+  const unique = Array.from(new Set(nodeIds.filter((id) => Number.isFinite(id) && id > 0))).slice(0, 10);
+  if (!unique.length) return [];
+  const placeholders = unique.map(() => "?").join(", ");
+  const result = await db.execute({
+    sql: `SELECT n.id, n.title, n.description, n.notes, n.link, n.node_type, n.event_date, n.metadata,
+                 COALESCE((SELECT JSON_GROUP_ARRAY(d.dimension)
+                           FROM node_dimensions d WHERE d.node_id = n.id), '[]') as dimensions_json
+          FROM nodes n
+          WHERE n.id IN (${placeholders})`,
+    args: unique,
+  });
+  return result.rows.map(rowToNode);
+}
+
+export async function queryEdges(
+  db: LibsqlClient,
+  nodeId: number,
+  limit: number = 25
+): Promise<Array<Record<string, unknown>>> {
+  const result = await db.execute({
+    sql: `SELECT
+            e.id, e.from_node_id, e.to_node_id, e.context, e.created_at,
+            CASE WHEN e.from_node_id = ? THEN n_to.id ELSE n_from.id END as connected_node_id,
+            CASE WHEN e.from_node_id = ? THEN n_to.title ELSE n_from.title END as connected_node_title,
+            CASE WHEN e.from_node_id = ? THEN n_to.node_type ELSE n_from.node_type END as connected_node_type,
+            CASE WHEN e.from_node_id = ? THEN n_to.description ELSE n_from.description END as connected_description,
+            CASE WHEN e.from_node_id = ? THEN n_to.link ELSE n_from.link END as connected_link,
+            CASE WHEN e.from_node_id = ? THEN 'outgoing' ELSE 'incoming' END as direction
+          FROM edges e
+          LEFT JOIN nodes n_from ON e.from_node_id = n_from.id
+          LEFT JOIN nodes n_to ON e.to_node_id = n_to.id
+          WHERE e.from_node_id = ? OR e.to_node_id = ?
+          ORDER BY e.created_at DESC
+          LIMIT ?`,
+    args: [nodeId, nodeId, nodeId, nodeId, nodeId, nodeId, nodeId, nodeId, limit],
+  });
+  return result.rows as unknown as Array<Record<string, unknown>>;
+}
+
+export async function listDimensions(
+  db: LibsqlClient
+): Promise<Array<{ name: string; description: string; count: number }>> {
+  const result = await db.execute({
+    sql: `WITH dimension_counts AS (
+            SELECT nd.dimension, COUNT(*) AS count
+            FROM node_dimensions nd
+            GROUP BY nd.dimension
+          )
+          SELECT
+            d.name,
+            d.description,
+            COALESCE(dc.count, 0) AS count
+          FROM dimensions d
+          LEFT JOIN dimension_counts dc ON dc.dimension = d.name
+          WHERE d.is_priority = 1
+          ORDER BY d.name ASC`,
+    args: [],
+  });
+  return result.rows.map((row) => ({
+    name: String(row.name),
+    description: String(row.description || ""),
+    count: Number(row.count),
+  }));
+}
+
+export async function getContext(
+  db: LibsqlClient
+): Promise<Record<string, unknown>> {
+  const [nodesResult, edgesResult, chunksResult] = await Promise.all([
+    db.execute({ sql: "SELECT COUNT(*) as cnt FROM nodes", args: [] }),
+    db.execute({ sql: "SELECT COUNT(*) as cnt FROM edges", args: [] }),
+    db.execute({ sql: "SELECT COUNT(*) as cnt FROM chunks", args: [] }),
+  ]);
+
+  return {
+    stats: {
+      nodes: Number(nodesResult.rows[0]?.cnt ?? 0),
+      edges: Number(edgesResult.rows[0]?.cnt ?? 0),
+      chunks: Number(chunksResult.rows[0]?.cnt ?? 0),
+    },
+  };
+}
+
+export async function sqliteQuery(
+  db: LibsqlClient,
+  sql: string
+): Promise<Array<Record<string, unknown>>> {
+  // Read-only enforcement
+  const normalized = sql.trim().toUpperCase();
+  if (!normalized.startsWith("SELECT") && !normalized.startsWith("WITH") && !normalized.startsWith("PRAGMA")) {
+    throw new Error("Only SELECT, WITH, and PRAGMA queries are allowed.");
+  }
+  const result = await db.execute({ sql, args: [] });
+  return result.rows as unknown as Array<Record<string, unknown>>;
+}
+
+// ── Helpers ────────────────────────────────────────────────────
+
+function parseMetadata(raw: unknown): unknown {
+  if (raw && typeof raw === "object") return raw;
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function rowToNode(row: Record<string, unknown>): NodeRow {
+  return {
+    id: Number(row.id),
+    title: String(row.title || ""),
+    notes: row.notes == null ? null : String(row.notes),
+    description: row.description == null ? null : String(row.description),
+    link: row.link == null ? null : String(row.link),
+    node_type: row.node_type == null ? null : String(row.node_type),
+    event_date: row.event_date == null ? null : String(row.event_date),
+    metadata: parseMetadata(row.metadata),
+  };
+}

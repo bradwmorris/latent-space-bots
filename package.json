@@ -15,10 +15,8 @@
   },
   "dependencies": {
     "@libsql/client": "^0.17.0",
-    "@modelcontextprotocol/sdk": "^1.27.1",
     "discord.js": "^14.19.3",
     "dotenv": "^17.2.3",
-    "latent-space-hub-mcp": "file:./vendor/latent-space-hub-mcp",
     "typescript": "^5.7.3"
   },
   "devDependencies": {

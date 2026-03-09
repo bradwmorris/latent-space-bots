@@ -17,7 +17,26 @@ import {
   type Message,
   type User
 } from "discord.js";
-import { McpGraphClient, normalizeTextContent, type ToolTrace } from "./mcpGraphClient";
+import { TOOL_DEFINITIONS, TOOL_HANDLERS, type OpenAIToolDef } from "./tools";
+import * as dbOps from "./db";
+
+export type ToolTrace = {
+  tool: string;
+  args: Record<string, unknown>;
+  result: unknown;
+  duration_ms: number;
+  error?: string;
+};
+
+const toolTraces: ToolTrace[] = [];
+function clearTraces(): ToolTrace[] {
+  const traces = [...toolTraces];
+  toolTraces.length = 0;
+  return traces;
+}
+function recordTrace(trace: ToolTrace): void {
+  toolTraces.push(trace);
+}
 
 type BotProfile = {
   name: "Slop";
@@ -106,7 +125,7 @@ const db = createLibsqlClient({
   url: TURSO_DATABASE_URL,
   authToken: TURSO_AUTH_TOKEN
 });
-const mcpGraph = new McpGraphClient();
+// MCP removed — all DB operations go through direct Turso queries (src/db.ts)
 
 type MemberMetadata = {
   discord_id: string;
@@ -297,7 +316,7 @@ function parseMetadata(raw: unknown): MemberMetadata {
 }
 
 async function lookupMember(discordId: string): Promise<MemberNode | null> {
-  const row = await mcpGraph.lookupMemberByDiscordId(discordId);
+  const row = await dbOps.lookupMemberByDiscordId(db, discordId);
   if (!row) return null;
   return {
     id: row.id,
@@ -312,7 +331,7 @@ async function createMemberNodeFromUser(
 ): Promise<{ id: number }> {
   const now = new Date().toISOString();
   const title = (user.globalName || user.username || "Discord Member").trim();
-  return mcpGraph.createMemberNode({
+  return dbOps.createMemberNode(db, {
     title,
     description: `${title} — community member profile in Latent Space Discord.`,
     metadata: {
@@ -396,7 +415,7 @@ async function updateMemberAfterInteraction(
   }
 
   const line = `[${nowIso.slice(0, 10)}] ${summarizeUserMessage(userMessage)}`;
-  await mcpGraph.updateMemberNode(member.id, {
+  await dbOps.updateMemberNode(db, member.id, {
     content: line,
     metadata: metadata as Record<string, unknown>
   });
@@ -405,7 +424,7 @@ async function updateMemberAfterInteraction(
   await Promise.all(
     uniqueTargets.map(async (targetId) => {
       try {
-        await mcpGraph.createMemberEdge(
+        await dbOps.createEdge(db,
           member.id,
           targetId,
           "showed interest in this content during a Discord conversation"
@@ -435,10 +454,8 @@ type SkillMeta = {
 
 const REQUIRED_SLOP_SKILLS = [
   "Start Here",
-  "Graph Search",
   "Member Profiles",
   "DB Operations",
-  "Curation",
   "Event Scheduling"
 ];
 const REQUIRED_SLOP_SKILL_SET = new Set(REQUIRED_SLOP_SKILLS.map((name) => normalizeSkillName(name)));
@@ -513,7 +530,7 @@ function loadSkillsContextFromLocalStrict(): string {
     .join("\n");
 
   cachedSkillsContext = [
-    "[SKILLS] Canonical source: local bot skills directory. Use ls_read_skill(name) for full instructions.",
+    "[SKILLS] Available skills. Use slop_read_skill(name) for full instructions.",
     lines,
   ].join("\n");
   return cachedSkillsContext;
@@ -716,7 +733,7 @@ async function generateAgenticResponse(
   options?: { systemPrompt?: string }
 ): Promise<AgenticResult> {
   const systemContent = options?.systemPrompt || buildSystemPrompt({ skillsContext: "", memberContext: "" });
-  const tools = await mcpGraph.getToolDefinitions();
+  const tools: OpenAIToolDef[] = TOOL_DEFINITIONS;
   const start = Date.now();
 
   const messages: OpenRouterMessage[] = [
@@ -798,17 +815,16 @@ async function generateAgenticResponse(
       try {
         const args = JSON.parse(tc.function.arguments || "{}");
 
-        if (toolName === "ls_read_skill" && typeof args.name === "string") {
+        const toolStart = Date.now();
+        if (toolName === "slop_read_skill" && typeof args.name === "string") {
           skillsRead.add(args.name);
           resultText = readLocalSkillStrict(args.name);
+        } else if (TOOL_HANDLERS[toolName]) {
+          resultText = await TOOL_HANDLERS[toolName].execute(args, db);
         } else {
-          const result = await mcpGraph.callTool(toolName, args);
-          if (result.structuredContent) {
-            resultText = JSON.stringify(result.structuredContent);
-          } else {
-            resultText = normalizeTextContent(result.content);
-          }
+          resultText = `Error: Unknown tool "${toolName}"`;
         }
+        recordTrace({ tool: toolName, args, result: resultText.length > 500 ? { length: resultText.length } : resultText, duration_ms: Date.now() - toolStart });
         if (resultText.length > MAX_TOOL_RESULT_CHARS) {
           resultText = resultText.slice(0, MAX_TOOL_RESULT_CHARS) + "\n...[truncated]";
         }
@@ -927,7 +943,7 @@ async function logTrace(
   options: TraceOptions
 ): Promise<void> {
   try {
-    const toolCalls: ToolTrace[] = mcpGraph.clearTraces();
+    const toolCalls: ToolTrace[] = clearTraces();
     const metadata = {
       interaction_kind: inferInteractionKind(options),
       discord_user_id: source.userId,
@@ -1084,8 +1100,8 @@ async function runDeterministicKickoff(payload: KickoffPayload): Promise<{ ok: t
     await destination.send(`${modelBadge(slopProfile.model)}\n${output}`);
     await destination.send(agenticToolsFooter(toolsUsed));
 
-    const nodeIds = mcpGraph.callTraces
-      .filter((t) => t.tool === "ls_get_nodes" || t.tool === "ls_search_nodes")
+    const nodeIds = toolTraces
+      .filter((t) => t.tool === "slop_get_nodes" || t.tool === "slop_search_nodes")
       .flatMap((t) => {
         const r = t.result as Record<string, unknown> | null;
         if (r && Array.isArray((r as { nodes?: unknown[] }).nodes)) return ((r as { nodes: Array<Record<string, unknown>> }).nodes).map((n) => Number(n.id)).filter(Number.isFinite);
@@ -1259,7 +1275,7 @@ async function createScheduledEvent(
     }
 
     const title = `${label}: ${cleanTitle}`;
-    const eventPayload: Parameters<typeof mcpGraph.createEventNode>[0] = isPaperClub
+    const eventPayload: Parameters<typeof dbOps.createEventNode>[1] = isPaperClub
       ? {
           title,
           description: `Hosted by ${session.memberUsername}. ${cleanTitle}`,
@@ -1282,8 +1298,8 @@ async function createScheduledEvent(
           topic: cleanTitle,
         };
 
-    const eventNode = await mcpGraph.createEventNode(eventPayload);
-    await mcpGraph.createMemberEdge(session.memberId, eventNode.id, `hosting ${label} session`);
+    const eventNode = await dbOps.createEventNode(db, eventPayload);
+    await dbOps.createEdge(db, session.memberId, eventNode.id, `hosting ${label} session`);
 
     const dateLabel = new Date(dateStr + "T12:00:00Z").toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
     const reply = `**${label} scheduled!**\n📅 ${dateLabel}\n📝 ${cleanTitle}\n🎤 ${session.memberUsername}`;
@@ -1339,7 +1355,7 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
   if (!withinRateLimit(message, profile.name, { ownedThread })) return;
   processedMessageIds.add(dedupeKey);
 
-  mcpGraph.clearTraces();
+  clearTraces();
   const startTime = Date.now();
   const traceSource = { userId: message.author.id, username: message.author.username, channelId: message.channelId, messageId: message.id };
 
@@ -1401,8 +1417,8 @@ async function handleMessage(client: Client, profile: BotProfile, message: Messa
     const { text: rawOutput, toolsUsed, skillsRead, trace } = await generateAgenticResponse(profile, prompt, { systemPrompt });
     const { clean: output, profile: profileUpdate } = parseProfileBlock(rawOutput);
     // Extract node IDs from tool call traces for member edge creation
-    const nodeIds = mcpGraph.callTraces
-      .filter((t) => t.tool === "ls_get_nodes" || t.tool === "ls_search_nodes")
+    const nodeIds = toolTraces
+      .filter((t) => t.tool === "slop_get_nodes" || t.tool === "slop_search_nodes")
       .flatMap((t) => {
         const r = t.result as Record<string, unknown> | null;
         if (!r) return [];
@@ -1457,7 +1473,7 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
     return;
   }
 
-  mcpGraph.clearTraces();
+  clearTraces();
   const startTime = Date.now();
   const traceSource = { userId: interaction.user.id, username: interaction.user.username, channelId: interaction.channelId || "", messageId: interaction.id };
   const command = interaction.commandName as "join" | "paper-club" | "builders-club";
@@ -1479,7 +1495,7 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
           avatar_url: interaction.user.displayAvatarURL({ size: 256, extension: "png" }),
           last_active: new Date().toISOString()
         };
-        await mcpGraph.updateMemberNode(existing.id, {
+        await dbOps.updateMemberNode(db, existing.id, {
           metadata: refreshedMetadata as Record<string, unknown>
         });
         const reply = `You're already in the graph. I've been tracking your interests since ${existing.metadata.joined_at}.`;
@@ -1511,7 +1527,7 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
             avatar_url: interaction.user.displayAvatarURL({ size: 256, extension: "png" }),
             last_active: new Date().toISOString()
           };
-          await mcpGraph.updateMemberNode(raced.id, {
+          await dbOps.updateMemberNode(db, raced.id, {
             metadata: refreshedMetadata as Record<string, unknown>
           });
           const reply = `You're already in the graph. I've been tracking your interests since ${raced.metadata.joined_at}.`;
@@ -1547,7 +1563,7 @@ async function handleInteraction(client: Client, profile: BotProfile, interactio
       const nextDates = getNextDatesForDay(targetDay, 6);
 
       // Check which dates are already booked
-      const booked = await mcpGraph.getBookedDates(command, nextDates);
+      const booked = await dbOps.getBookedDates(db, command, nextDates);
       const available = nextDates.filter((d) => !booked.has(d)).slice(0, 4);
 
       if (!available.length) {
@@ -1676,9 +1692,7 @@ async function main(): Promise<void> {
     console.warn("ALLOWED_CHANNEL_IDS not set. Bots will respond in any channel they can read.");
   }
   await ensureMemberDiscordIndex();
-  await mcpGraph.connect();
-  const toolDefs = await mcpGraph.getToolDefinitions();
-  console.log(`MCP tools cached: ${toolDefs.length} read-only tools available for LLM`);
+  console.log(`Local tools loaded: ${TOOL_DEFINITIONS.length} read-only tools available for LLM`);
   const skillsCtx = loadSkillsContextFromLocalStrict();
   console.log(`Skills loaded: ${skillsCtx.length} chars`);
   await Promise.all(profiles.map((profile) => startBot(profile)));

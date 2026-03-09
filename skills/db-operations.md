@@ -1,24 +1,15 @@
 ---
 name: DB Operations
 skill_group: slop
-description: "Slop-specific graph read/write policy for Discord interactions."
-when_to_use: "When Slop needs to read or update wiki-base data while answering Discord mentions, thread replies, or slash-command workflows."
-when_not_to_use: "General agent setup tasks or non-Slop assistants."
-success_criteria: "Slop retrieval is accurate and write operations are explicit, deduplicated, and consistent with Discord bot workflows."
+description: "Schema, search patterns, citation format, and response framing for Slop's graph queries."
+when_to_use: "When answering factual questions that need graph retrieval, or when you need schema details."
+when_not_to_use: "Pure opinion prompts with no factual claims or retrieval need."
+success_criteria: "Responses are grounded in retrieved evidence with correct source links and natural framing."
 ---
 
 # DB Operations
 
-DB policy for **Slop**. Use this when Slop is retrieving or mutating wiki-base data during Discord conversations.
-
-## Core Rules
-
-1. **Search before create.** Always run `ls_search_nodes` before `ls_add_node`. Duplicates degrade the graph.
-2. **Descriptions are mandatory.** Every node needs a concise, informative description (1-2 sentences).
-3. **Dimensions are required.** At least 1, max 5 per node. Use existing dimensions when possible.
-4. **Edge explanations matter.** Every edge needs a human-readable `explanation` field.
-5. **Use `ls_sqlite_query` for read-only inspection** — SELECT/WITH/PRAGMA only.
-6. **Discord-first framing.** Query results must be transformed into concise thread-friendly responses with source links.
+Schema and retrieval policy for **Slop**.
 
 ## Schema
 
@@ -27,7 +18,7 @@ Core tables:
 - `node_dimensions` — many-to-many between nodes and dimensions
 - `dimensions` — taxonomy definitions (name, description, icon, is_priority)
 - `edges` — directed relationships (from_node_id, to_node_id, context JSON with explanation + type)
-- `chunks` — retrieval text segments (node_id, content, position, embedding)
+- `chunks` — retrieval text segments (node_id, text, position, embedding)
 
 ## Node Types
 
@@ -38,44 +29,42 @@ Content types (sort by event_date descending):
 - `builders-club` — Community meetup sessions and demos. Key: title, event_date, link, transcript chunks.
 - `paper-club` — Academic paper deep-dives. Key: title, event_date, link, metadata.paper_title.
 - `workshop` — Conference talks and tutorials from AI Engineer events. Key: title, event_date, link, transcript chunks.
+- `event` — Scheduled/completed Paper Club and Builders Club sessions. Key: event_date, metadata.event_type, metadata.event_status.
 
 Entity types (sort by edge count descending):
 - `guest` — People who appear in content. Key: title, description, edges to appearances.
 - `entity` — Organizations, tools, topics, concepts. Key: title, description, edges to content nodes.
 - `member` — Community members. Key: title, description, metadata (role, company, interests, avatar_url).
 
-## Search Patterns
+## Search Strategy
 
-### Core retrieval pattern
-1. Node-level scan with `ls_search_nodes` (title/description/notes matching).
-2. Apply type/time filters when question implies them.
-3. Pull source evidence with `ls_search_content` (chunk-level text).
-4. Traverse edges with `ls_query_edges` for related entities and timeline context.
-5. Cite type + title + date + URL in final answer.
+1. Start with `slop_search_nodes` for most queries. Supports `node_type` filter.
+2. Use `slop_search_content` for specific quotes, passages, or deep transcript searches.
+3. Use `slop_get_nodes` to load full records by ID after finding matches.
+4. Use `slop_sqlite_query` for "latest", counting, or date-range queries (`ORDER BY event_date DESC`).
+5. Use `slop_query_edges` to traverse connections from a node.
+6. If the first search misses, retry with different keywords and/or content search.
 
 ### Temporal queries
-Use date-aware filters for "recent", "this month", "since January", "timeline of X":
-- `sortBy: "event_date"`
-- `event_after: "YYYY-MM-DD"`
-- `event_before: "YYYY-MM-DD"`
-
-### Type-filtered queries
-Use `node_type` when user asks about a specific content source:
-- "podcasts about X" → `node_type: "podcast"`
-- "AINews on Y" → `node_type: "ainews"`
+Use `slop_sqlite_query` for date-aware searches:
+```sql
+SELECT id, title, event_date, link FROM nodes
+WHERE node_type = 'podcast' AND event_date >= '2025-01-01'
+ORDER BY event_date DESC LIMIT 10
+```
 
 ### Entity-aware queries
 Questions about people/orgs/topics require graph traversal:
-1. Find seed nodes (`ls_search_nodes`)
-2. Expand with `ls_query_edges`
-3. Read supporting chunks (`ls_search_content`)
+1. Find seed nodes (`slop_search_nodes`)
+2. Expand with `slop_query_edges`)
+3. Read supporting chunks (`slop_search_content`)
 
 ## Citation Rules
 
 When making factual claims, cite sources with:
 - Content type, title, guest/author/speaker, date (event_date), URL
 
-Format: `Type — "Title" (Person, YYYY-MM-DD): URL`
+Format: `[Title](url)` — include type and date naturally in prose.
 
 If the graph lacks evidence for a claim, say that explicitly.
 
