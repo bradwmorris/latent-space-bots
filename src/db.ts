@@ -87,7 +87,7 @@ export async function updateMemberNode(
   const now = new Date().toISOString();
   if (updates.content) {
     await db.execute({
-      sql: `UPDATE nodes SET notes = ?, metadata = ?, updated_at = ? WHERE id = ?`,
+      sql: `UPDATE nodes SET notes = COALESCE(notes || char(10), '') || ?, metadata = ?, updated_at = ? WHERE id = ?`,
       args: [updates.content, JSON.stringify(updates.metadata), now, nodeId],
     });
   } else {
