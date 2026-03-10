@@ -1,7 +1,7 @@
 import { ThreadAutoArchiveDuration, type ChatInputCommandInteraction, type Message } from "discord.js";
 import * as dbOps from "../db";
 import { db } from "../config";
-import { lookupMember } from "../members";
+import { lookupMember, createMemberNodeFromUser } from "../members";
 import { logTrace } from "../llm/tracing";
 import type { BotProfile, SchedulingSession } from "../types";
 
@@ -31,10 +31,14 @@ export async function handleScheduleCommand(
   command: "paper-club" | "builders-club"
 ): Promise<void> {
   try {
-    const member = await lookupMember(interaction.user.id);
+    let member = await lookupMember(interaction.user.id);
     if (!member) {
-      await interaction.editReply("You need to `/join` the graph first before scheduling events.");
-      return;
+      const created = await createMemberNodeFromUser(interaction.user);
+      member = await lookupMember(interaction.user.id);
+      if (!member) {
+        await interaction.editReply("Couldn't create your profile. Try again or run `/join` first.");
+        return;
+      }
     }
 
     const isPaperClub = command === "paper-club";
