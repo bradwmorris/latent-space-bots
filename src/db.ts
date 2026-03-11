@@ -26,6 +26,13 @@ export type EventReminderRow = {
   metadata: unknown;
 };
 
+export type ScheduledEventRow = {
+  id: number;
+  title: string;
+  event_date: string;
+  metadata: unknown;
+};
+
 type EdgeContext = {
   type: string;
   confidence: number;
@@ -90,19 +97,22 @@ export async function updateMemberNode(
   db: LibsqlClient,
   nodeId: number,
   updates: { content?: string; metadata: Record<string, unknown> }
-): Promise<void> {
+): Promise<number> {
   const now = new Date().toISOString();
+  let result;
   if (updates.content) {
-    await db.execute({
+    result = await db.execute({
       sql: `UPDATE nodes SET notes = COALESCE(notes || char(10), '') || ?, metadata = ?, updated_at = ? WHERE id = ?`,
       args: [updates.content, JSON.stringify(updates.metadata), now, nodeId],
     });
   } else {
-    await db.execute({
+    result = await db.execute({
       sql: `UPDATE nodes SET metadata = ?, updated_at = ? WHERE id = ?`,
       args: [JSON.stringify(updates.metadata), now, nodeId],
     });
   }
+
+  return Number(result.rowsAffected || 0);
 }
 
 // ── Event operations ───────────────────────────────────────────
@@ -159,6 +169,140 @@ export async function createEventNode(
   return { id: nodeId };
 }
 
+export async function createEventNodeAtomic(
+  db: LibsqlClient,
+  payload: {
+    title: string;
+    description?: string;
+    event_date: string;
+    event_type: "paper-club" | "builders-club";
+    presenter_name: string;
+    presenter_discord_id?: string;
+    presenter_node_id?: number;
+    paper_url?: string;
+    paper_title?: string;
+    topic?: string;
+  }
+): Promise<{ nodeId: number; alreadyBooked: boolean }> {
+  try {
+    const inserted = await createEventNode(db, payload);
+    return { nodeId: inserted.id, alreadyBooked: false };
+  } catch (error) {
+    if (isUniqueConstraintError(error)) {
+      return { nodeId: 0, alreadyBooked: true };
+    }
+    throw error;
+  }
+}
+
+export async function ensureScheduledEventSlotIndex(db: LibsqlClient): Promise<void> {
+  await db.execute({
+    sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_scheduled_event_slot_unique
+          ON nodes(event_date, json_extract(metadata, '$.event_type'))
+          WHERE node_type = 'event'
+            AND json_extract(metadata, '$.event_status') = 'scheduled'
+            AND event_date IS NOT NULL`,
+    args: [],
+  });
+}
+
+export async function getScheduledEventsByPresenter(
+  db: LibsqlClient,
+  presenterDiscordId: string
+): Promise<ScheduledEventRow[]> {
+  const result = await db.execute({
+    sql: `SELECT id, title, event_date, metadata
+          FROM nodes
+          WHERE node_type = 'event'
+            AND json_extract(metadata, '$.event_status') = 'scheduled'
+            AND json_extract(metadata, '$.presenter_discord_id') = ?
+          ORDER BY event_date ASC`,
+    args: [presenterDiscordId],
+  });
+
+  return result.rows.map((row) => ({
+    id: Number(row.id),
+    title: String(row.title || ""),
+    event_date: String(row.event_date || ""),
+    metadata: parseMetadata(row.metadata),
+  }));
+}
+
+export async function updateEventNode(
+  db: LibsqlClient,
+  params: {
+    nodeId: number;
+    presenterDiscordId: string;
+    title?: string;
+    description?: string;
+    eventDate?: string;
+    metadataUpdates?: Record<string, unknown>;
+    cancel?: boolean;
+  }
+): Promise<{ ok: boolean; reason?: "not_found_or_not_owner" | "already_booked" }> {
+  const existing = await db.execute({
+    sql: `SELECT id, metadata
+          FROM nodes
+          WHERE id = ?
+            AND node_type = 'event'
+            AND json_extract(metadata, '$.presenter_discord_id') = ?
+            AND json_extract(metadata, '$.event_status') = 'scheduled'
+          LIMIT 1`,
+    args: [params.nodeId, params.presenterDiscordId],
+  });
+
+  if (!existing.rows.length) {
+    return { ok: false, reason: "not_found_or_not_owner" };
+  }
+
+  const row = existing.rows[0];
+  const currentMetadata = parseMetadata(row.metadata) as Record<string, unknown>;
+  const mergedMetadata: Record<string, unknown> = {
+    ...currentMetadata,
+    ...(params.metadataUpdates || {}),
+  };
+
+  if (params.cancel) {
+    mergedMetadata.event_status = "cancelled";
+  }
+
+  const now = new Date().toISOString();
+  const setClauses: string[] = [];
+  const args: Array<string | number | null> = [];
+
+  if (params.title !== undefined) {
+    setClauses.push("title = ?");
+    args.push(params.title);
+  }
+  if (params.description !== undefined) {
+    setClauses.push("description = ?");
+    args.push(params.description);
+  }
+  if (params.eventDate !== undefined) {
+    setClauses.push("event_date = ?");
+    args.push(params.eventDate);
+  }
+  setClauses.push("metadata = ?", "updated_at = ?");
+  args.push(JSON.stringify(mergedMetadata), now, params.nodeId);
+
+  try {
+    const result = await db.execute({
+      sql: `UPDATE nodes SET ${setClauses.join(", ")} WHERE id = ?`,
+      args,
+    });
+    if (Number(result.rowsAffected || 0) === 0) {
+      return { ok: false, reason: "not_found_or_not_owner" };
+    }
+  } catch (error) {
+    if (isUniqueConstraintError(error)) {
+      return { ok: false, reason: "already_booked" };
+    }
+    throw error;
+  }
+
+  return { ok: true };
+}
+
 export async function getBookedDates(
   db: LibsqlClient,
   eventType: string,
@@ -210,6 +354,23 @@ export async function getPaperClubEventsForDate(
   db: LibsqlClient,
   targetDate: string
 ): Promise<EventReminderRow[]> {
+  return getPaperClubEventsForDateAndWindow(db, targetDate, "24h");
+}
+
+export async function getPaperClubEventsForDateOneHour(
+  db: LibsqlClient,
+  targetDate: string
+): Promise<EventReminderRow[]> {
+  return getPaperClubEventsForDateAndWindow(db, targetDate, "1h");
+}
+
+async function getPaperClubEventsForDateAndWindow(
+  db: LibsqlClient,
+  targetDate: string,
+  window: "24h" | "1h"
+): Promise<EventReminderRow[]> {
+  const remindedAtField = window === "24h" ? "$.reminded_24h_at" : "$.reminded_1h_at";
+  const claimedAtField = window === "24h" ? "$.reminded_24h_claimed_at" : "$.reminded_1h_claimed_at";
   const result = await db.execute({
     sql: `SELECT id, title, event_date, metadata
           FROM nodes
@@ -217,7 +378,11 @@ export async function getPaperClubEventsForDate(
             AND json_extract(metadata, '$.event_status') = 'scheduled'
             AND json_extract(metadata, '$.event_type') = 'paper-club'
             AND event_date = ?
-            AND json_extract(metadata, '$.reminded_24h_at') IS NULL
+            AND json_extract(metadata, '${remindedAtField}') IS NULL
+            AND (
+              json_extract(metadata, '${claimedAtField}') IS NULL
+              OR datetime(json_extract(metadata, '${claimedAtField}')) <= datetime('now', '-3 hours')
+            )
           ORDER BY event_date ASC`,
     args: [targetDate],
   });
@@ -235,21 +400,44 @@ export async function claimPaperClub24hReminder(
   eventId: number,
   instanceId: string
 ): Promise<boolean> {
+  return claimPaperClubReminder(db, eventId, instanceId, "24h");
+}
+
+export async function claimPaperClub1hReminder(
+  db: LibsqlClient,
+  eventId: number,
+  instanceId: string
+): Promise<boolean> {
+  return claimPaperClubReminder(db, eventId, instanceId, "1h");
+}
+
+async function claimPaperClubReminder(
+  db: LibsqlClient,
+  eventId: number,
+  instanceId: string,
+  window: "24h" | "1h"
+): Promise<boolean> {
   const now = new Date().toISOString();
+  const claimedAtField = window === "24h" ? "$.reminded_24h_claimed_at" : "$.reminded_1h_claimed_at";
+  const claimedByField = window === "24h" ? "$.reminded_24h_claimed_by" : "$.reminded_1h_claimed_by";
+  const remindedAtField = window === "24h" ? "$.reminded_24h_at" : "$.reminded_1h_at";
   const result = await db.execute({
     sql: `UPDATE nodes
           SET metadata = json_set(
                 coalesce(metadata, '{}'),
-                '$.reminded_24h_claimed_at', ?,
-                '$.reminded_24h_claimed_by', ?
+                '${claimedAtField}', ?,
+                '${claimedByField}', ?
               ),
               updated_at = ?
           WHERE id = ?
             AND node_type = 'event'
             AND json_extract(metadata, '$.event_status') = 'scheduled'
             AND json_extract(metadata, '$.event_type') = 'paper-club'
-            AND json_extract(metadata, '$.reminded_24h_at') IS NULL
-            AND json_extract(metadata, '$.reminded_24h_claimed_at') IS NULL`,
+            AND json_extract(metadata, '${remindedAtField}') IS NULL
+            AND (
+              json_extract(metadata, '${claimedAtField}') IS NULL
+              OR datetime(json_extract(metadata, '${claimedAtField}')) <= datetime('now', '-3 hours')
+            )`,
     args: [now, instanceId, now, eventId],
   });
   return Number(result.rowsAffected || 0) > 0;
@@ -260,17 +448,38 @@ export async function finalizePaperClub24hReminder(
   eventId: number,
   messageId: string
 ): Promise<void> {
+  return finalizePaperClubReminder(db, eventId, messageId, "24h");
+}
+
+export async function finalizePaperClub1hReminder(
+  db: LibsqlClient,
+  eventId: number,
+  messageId: string
+): Promise<void> {
+  return finalizePaperClubReminder(db, eventId, messageId, "1h");
+}
+
+async function finalizePaperClubReminder(
+  db: LibsqlClient,
+  eventId: number,
+  messageId: string,
+  window: "24h" | "1h"
+): Promise<void> {
   const now = new Date().toISOString();
+  const claimedAtField = window === "24h" ? "$.reminded_24h_claimed_at" : "$.reminded_1h_claimed_at";
+  const claimedByField = window === "24h" ? "$.reminded_24h_claimed_by" : "$.reminded_1h_claimed_by";
+  const remindedAtField = window === "24h" ? "$.reminded_24h_at" : "$.reminded_1h_at";
+  const messageIdField = window === "24h" ? "$.reminded_24h_message_id" : "$.reminded_1h_message_id";
   await db.execute({
     sql: `UPDATE nodes
           SET metadata = json_set(
                 json_remove(
                   coalesce(metadata, '{}'),
-                  '$.reminded_24h_claimed_at',
-                  '$.reminded_24h_claimed_by'
+                  '${claimedAtField}',
+                  '${claimedByField}'
                 ),
-                '$.reminded_24h_at', ?,
-                '$.reminded_24h_message_id', ?
+                '${remindedAtField}', ?,
+                '${messageIdField}', ?
               ),
               updated_at = ?
           WHERE id = ?`,
@@ -283,18 +492,38 @@ export async function releasePaperClub24hReminderClaim(
   eventId: number,
   instanceId: string
 ): Promise<void> {
+  return releasePaperClubReminderClaim(db, eventId, instanceId, "24h");
+}
+
+export async function releasePaperClub1hReminderClaim(
+  db: LibsqlClient,
+  eventId: number,
+  instanceId: string
+): Promise<void> {
+  return releasePaperClubReminderClaim(db, eventId, instanceId, "1h");
+}
+
+async function releasePaperClubReminderClaim(
+  db: LibsqlClient,
+  eventId: number,
+  instanceId: string,
+  window: "24h" | "1h"
+): Promise<void> {
   const now = new Date().toISOString();
+  const claimedAtField = window === "24h" ? "$.reminded_24h_claimed_at" : "$.reminded_1h_claimed_at";
+  const claimedByField = window === "24h" ? "$.reminded_24h_claimed_by" : "$.reminded_1h_claimed_by";
+  const remindedAtField = window === "24h" ? "$.reminded_24h_at" : "$.reminded_1h_at";
   await db.execute({
     sql: `UPDATE nodes
           SET metadata = json_remove(
                 coalesce(metadata, '{}'),
-                '$.reminded_24h_claimed_at',
-                '$.reminded_24h_claimed_by'
+                '${claimedAtField}',
+                '${claimedByField}'
               ),
               updated_at = ?
           WHERE id = ?
-            AND json_extract(metadata, '$.reminded_24h_claimed_by') = ?
-            AND json_extract(metadata, '$.reminded_24h_at') IS NULL`,
+            AND json_extract(metadata, '${claimedByField}') = ?
+            AND json_extract(metadata, '${remindedAtField}') IS NULL`,
     args: [now, eventId, instanceId],
   });
 }
@@ -686,6 +915,11 @@ function parseMetadata(raw: unknown): unknown {
     }
   }
   return {};
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return /unique|constraint|already exists/i.test(msg);
 }
 
 function rowToNode(row: Record<string, unknown>): NodeRow {

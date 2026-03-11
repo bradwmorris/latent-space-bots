@@ -8,11 +8,12 @@ Gateway runtime implemented for:
 - Mention/reply handling with thread-first replies
 - Single-owner thread routing: if a user tags one bot, that bot owns the thread follow-up conversation
 - Slash commands: `/join`, `/paper-club`, `/builders-club`
-- MCP-first graph access via `latent-space-hub-mcp` tools
+- Slash command: `/edit-event` for updating/canceling your scheduled sessions
+- Direct Turso graph access via parameterized SQL
 - Channel allowlist + basic rate limiting
 - Optional chat logging to Turso (`ENABLE_CHAT_LOG_WRITE=true`)
 - Kickoff API (`POST /internal/kickoff`) for announcement → Slop response without mention-trigger dependence
-- Daily Paper Club reminder (day-before at 12:00pm PT; DB-backed idempotency)
+- Daily Paper Club reminders (24h-before at 12:00pm PT and optional 1h-before at 11:00am PT; DB-backed idempotency)
 
 ## Slash commands
 
@@ -21,6 +22,7 @@ Gateway runtime implemented for:
 | `/join` | none | Add yourself as a member node in the Latent Space graph |
 | `/paper-club` | none | Schedule a Paper Club session — pick a date and paper |
 | `/builders-club` | none | Schedule a Builders Club session — pick a date and topic |
+| `/edit-event` | none | Edit title, paper URL, date, or cancel your scheduled event |
 
 ## Member Memory
 
@@ -31,15 +33,9 @@ After a user runs `/join`:
 - After each response, the bot appends a one-line interaction note, updates metadata (`last_active`, `interaction_count`, `interests`), and creates member → content edges for retrieved items.
 - Post-response graph writes are non-blocking (Slop still replies even if writes fail).
 
-## MCP graph runtime
+## Graph runtime
 
-Bots use the MCP server (`latent-space-hub-mcp`) for graph reads/writes.
-
-Optional override:
-
-```bash
-LS_HUB_MCP_SERVER_PATH=/absolute/path/to/latent-space-hub/apps/mcp-server-standalone/index.js
-```
+Bots use direct Turso access (`@libsql/client`) for graph reads/writes.
 
 ## Persona (`SOUL`) files
 
@@ -92,11 +88,14 @@ Behavior:
 
 ## Event reminder config
 
-Paper Club reminders run once per day at noon Pacific (`America/Los_Angeles`) and post for events scheduled on the next calendar day.
+Paper Club reminders:
+- **24h reminder:** daily at 12:00pm Pacific for next-day events
+- **1h reminder:** daily at 11:00am Pacific for same-day events (for 12pm PT sessions)
 
 Required/optional env vars:
 
 - `REMINDERS_ENABLED` (default `true`)
+- `REMINDERS_ONE_HOUR_ENABLED` (default `true`)
 - `PAPER_CLUB_CHANNEL_ID` (required if reminders enabled)
 - `REMINDERS_TIMEZONE` (default `America/Los_Angeles`)
 - `BOT_INSTANCE_ID` (optional; defaults to host/pid)

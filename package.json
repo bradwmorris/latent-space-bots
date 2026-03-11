@@ -11,6 +11,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
+    "test": "vitest run",
     "backfill:member-avatars": "tsx scripts/backfill-member-avatars.ts"
   },
   "dependencies": {
@@ -23,6 +24,7 @@
   "devDependencies": {
     "@types/node": "^22.13.4",
     "@types/node-cron": "^3.0.11",
-    "tsx": "^4.20.3"
+    "tsx": "^4.20.3",
+    "vitest": "^2.1.9"
   }
 }
