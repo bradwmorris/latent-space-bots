@@ -1,10 +1,12 @@
 import {
   ThreadAutoArchiveDuration,
+  type Client,
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
 import * as dbOps from "../db";
 import { db } from "../config";
+import { lookupMember } from "../members";
 import { getNextDatesForDay } from "./schedulingDates";
 import { validateEventDate, validateEventTitle, validatePaperUrl } from "./validation";
 
@@ -51,6 +53,13 @@ function formatEventLine(event: EditableEvent, idx: number): string {
   return `**${idx + 1}.** ${label} — ${event.eventDate} — ${event.title}`;
 }
 
+function menuPrompt(eventType: "paper-club" | "builders-club"): string {
+  if (eventType === "paper-club") {
+    return "Reply with:\n`1` change title\n`2` change paper URL\n`3` reschedule date\n`4` cancel event\n`5` done";
+  }
+  return "Reply with:\n`1` change title\n`2` reschedule date\n`3` cancel event\n`4` done";
+}
+
 function toEditableEvent(row: dbOps.ScheduledEventRow): EditableEvent | null {
   const metadata = (row.metadata && typeof row.metadata === "object")
     ? (row.metadata as Record<string, unknown>)
@@ -72,7 +81,12 @@ export function getEditEventSession(channelId: string): EditSession | undefined 
 
 export async function handleEditEventCommand(interaction: ChatInputCommandInteraction): Promise<void> {
   try {
-    const rows = await dbOps.getScheduledEventsByPresenter(db, interaction.user.id);
+    const member = await lookupMember(interaction.user.id);
+    const rows = await dbOps.getScheduledEventsByPresenter(db, {
+      presenterDiscordId: interaction.user.id,
+      presenterNodeId: member?.id,
+      presenterName: interaction.user.username,
+    });
     const events = rows.map(toEditableEvent).filter((event): event is EditableEvent => event !== null);
     if (!events.length) {
       await interaction.editReply("You don't have any upcoming scheduled events.");
@@ -82,6 +96,7 @@ export async function handleEditEventCommand(interaction: ChatInputCommandIntera
     const message = await interaction.editReply("Opening event editor...");
     let sessionKey = interaction.channelId || "";
     let fallback = true;
+    let promptChannel = interaction.channel;
 
     try {
       const channel = interaction.channel;
@@ -94,6 +109,7 @@ export async function handleEditEventCommand(interaction: ChatInputCommandIntera
         });
         sessionKey = thread.id;
         fallback = false;
+        promptChannel = thread;
       }
     } catch {
       // Fall back to channel session.
@@ -101,6 +117,12 @@ export async function handleEditEventCommand(interaction: ChatInputCommandIntera
 
     if (fallback && editSessions.has(sessionKey)) {
       await interaction.followUp("Another event editing session is already active in this channel.");
+      return;
+    }
+
+    const canSend = promptChannel && promptChannel.isTextBased() && "send" in promptChannel;
+    if (!canSend) {
+      await interaction.followUp("Couldn't open an editable thread/channel for this command. Please try again.");
       return;
     }
 
@@ -112,9 +134,9 @@ export async function handleEditEventCommand(interaction: ChatInputCommandIntera
         selectedEventId: only.id,
         step: "menu",
       });
-      await interaction.followUp(
+      await (promptChannel as unknown as { send: (x: string) => Promise<unknown> }).send(
         `Editing:\n${formatEventLine(only, 0)}\n\n` +
-        "Reply with:\n`1` change title\n`2` change paper URL (Paper Club)\n`3` reschedule date\n`4` cancel event\n`5` done"
+        menuPrompt(only.eventType)
       );
       return;
     }
@@ -124,7 +146,7 @@ export async function handleEditEventCommand(interaction: ChatInputCommandIntera
       events,
       step: "pick_event",
     });
-    await interaction.followUp(
+    await (promptChannel as unknown as { send: (x: string) => Promise<unknown> }).send(
       `Pick the event to edit:\n${events.map((event, idx) => formatEventLine(event, idx)).join("\n")}`
     );
   } catch (error) {
@@ -147,7 +169,7 @@ export async function handleEditEventReply(message: Message, session: EditSessio
     session.step = "menu";
     await message.reply(
       `Editing:\n${formatEventLine(selected, n - 1)}\n\n` +
-      "Reply with:\n`1` change title\n`2` change paper URL (Paper Club)\n`3` reschedule date\n`4` cancel event\n`5` done"
+      menuPrompt(selected.eventType)
     );
     return;
   }
@@ -165,16 +187,17 @@ export async function handleEditEventReply(message: Message, session: EditSessio
       await message.reply("Send the new title/topic.");
       return;
     }
-    if (text === "2") {
-      if (selected.eventType !== "paper-club") {
-        await message.reply("Paper URL only applies to Paper Club events. Pick another option.");
-        return;
-      }
+    if (selected.eventType === "paper-club" && text === "2") {
       session.step = "edit_url";
       await message.reply("Send the new paper URL, or `none` to remove it.");
       return;
     }
-    if (text === "3") {
+
+    const rescheduleChoice = selected.eventType === "paper-club" ? "3" : "2";
+    const cancelChoice = selected.eventType === "paper-club" ? "4" : "3";
+    const doneChoice = selected.eventType === "paper-club" ? "5" : "4";
+
+    if (text === rescheduleChoice) {
       const targetDay = selected.eventType === "paper-club" ? 3 : 5;
       const nextDates = getNextDatesForDay(targetDay, 8);
       const booked = await dbOps.getBookedDates(db, selected.eventType, nextDates);
@@ -186,7 +209,7 @@ export async function handleEditEventReply(message: Message, session: EditSessio
       );
       return;
     }
-    if (text === "4") {
+    if (text === cancelChoice) {
       const result = await dbOps.updateEventNode(db, {
         nodeId: selected.id,
         presenterDiscordId: session.memberDiscordId,
@@ -201,12 +224,12 @@ export async function handleEditEventReply(message: Message, session: EditSessio
       clearEditSession(message.channelId);
       return;
     }
-    if (text === "5") {
+    if (text === doneChoice) {
       await message.reply("Done. Event editor closed.");
       clearEditSession(message.channelId);
       return;
     }
-    await message.reply("Reply with 1, 2, 3, 4, or 5.");
+    await message.reply("That option isn't valid for this event type. Use the numbered menu shown above.");
     return;
   }
 
@@ -233,7 +256,7 @@ export async function handleEditEventReply(message: Message, session: EditSessio
     }
     selected.title = `${label}: ${validTitle.title}`;
     session.step = "menu";
-    await message.reply("Title updated. Reply with 1, 2, 3, 4, or 5.");
+    await message.reply(`Title updated.\n\n${menuPrompt(selected.eventType)}`);
     return;
   }
 
@@ -250,7 +273,7 @@ export async function handleEditEventReply(message: Message, session: EditSessio
         return;
       }
       session.step = "menu";
-      await message.reply("Paper URL removed. Reply with 1, 2, 3, 4, or 5.");
+      await message.reply(`Paper URL removed.\n\n${menuPrompt(selected.eventType)}`);
       return;
     }
 
@@ -270,7 +293,7 @@ export async function handleEditEventReply(message: Message, session: EditSessio
       return;
     }
     session.step = "menu";
-    await message.reply("Paper URL updated. Reply with 1, 2, 3, 4, or 5.");
+    await message.reply(`Paper URL updated.\n\n${menuPrompt(selected.eventType)}`);
     return;
   }
 
@@ -303,6 +326,6 @@ export async function handleEditEventReply(message: Message, session: EditSessio
     }
     selected.eventDate = chosenDate;
     session.step = "menu";
-    await message.reply(`Date updated to ${chosenDate}. Reply with 1, 2, 3, 4, or 5.`);
+    await message.reply(`Date updated to ${chosenDate}.\n\n${menuPrompt(selected.eventType)}`);
   }
 }

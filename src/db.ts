@@ -208,16 +208,31 @@ export async function ensureScheduledEventSlotIndex(db: LibsqlClient): Promise<v
 
 export async function getScheduledEventsByPresenter(
   db: LibsqlClient,
-  presenterDiscordId: string
+  params: {
+    presenterDiscordId: string;
+    presenterNodeId?: number;
+    presenterName?: string;
+  }
 ): Promise<ScheduledEventRow[]> {
+  const where: string[] = ["json_extract(metadata, '$.presenter_discord_id') = ?"];
+  const args: Array<string | number> = [params.presenterDiscordId];
+  if (params.presenterNodeId && Number.isFinite(params.presenterNodeId) && params.presenterNodeId > 0) {
+    where.push("json_extract(metadata, '$.presenter_node_id') = ?");
+    args.push(params.presenterNodeId);
+  }
+  if (params.presenterName && params.presenterName.trim()) {
+    where.push("LOWER(json_extract(metadata, '$.presenter_name')) = LOWER(?)");
+    args.push(params.presenterName.trim());
+  }
+
   const result = await db.execute({
     sql: `SELECT id, title, event_date, metadata
           FROM nodes
           WHERE node_type = 'event'
             AND json_extract(metadata, '$.event_status') = 'scheduled'
-            AND json_extract(metadata, '$.presenter_discord_id') = ?
+            AND (${where.join(" OR ")})
           ORDER BY event_date ASC`,
-    args: [presenterDiscordId],
+    args,
   });
 
   return result.rows.map((row) => ({
