@@ -248,6 +248,8 @@ export async function updateEventNode(
   params: {
     nodeId: number;
     presenterDiscordId: string;
+    presenterNodeId?: number;
+    presenterName?: string;
     title?: string;
     description?: string;
     eventDate?: string;
@@ -255,15 +257,26 @@ export async function updateEventNode(
     cancel?: boolean;
   }
 ): Promise<{ ok: boolean; reason?: "not_found_or_not_owner" | "already_booked" }> {
+  const ownerChecks: string[] = ["json_extract(metadata, '$.presenter_discord_id') = ?"];
+  const ownerArgs: Array<string | number> = [params.presenterDiscordId];
+  if (params.presenterNodeId && Number.isFinite(params.presenterNodeId) && params.presenterNodeId > 0) {
+    ownerChecks.push("json_extract(metadata, '$.presenter_node_id') = ?");
+    ownerArgs.push(params.presenterNodeId);
+  }
+  if (params.presenterName && params.presenterName.trim()) {
+    ownerChecks.push("LOWER(json_extract(metadata, '$.presenter_name')) = LOWER(?)");
+    ownerArgs.push(params.presenterName.trim());
+  }
+
   const existing = await db.execute({
     sql: `SELECT id, metadata
           FROM nodes
           WHERE id = ?
             AND node_type = 'event'
-            AND json_extract(metadata, '$.presenter_discord_id') = ?
+            AND (${ownerChecks.join(" OR ")})
             AND json_extract(metadata, '$.event_status') = 'scheduled'
           LIMIT 1`,
-    args: [params.nodeId, params.presenterDiscordId],
+    args: [params.nodeId, ...ownerArgs],
   });
 
   if (!existing.rows.length) {

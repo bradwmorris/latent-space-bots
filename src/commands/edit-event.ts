@@ -1,6 +1,5 @@
 import {
   ThreadAutoArchiveDuration,
-  type Client,
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
@@ -20,6 +19,8 @@ type EditableEvent = {
 
 type EditSession = {
   memberDiscordId: string;
+  memberNodeId?: number;
+  memberUsername?: string;
   events: EditableEvent[];
   selectedEventId?: number;
   step: "pick_event" | "menu" | "edit_title" | "edit_url" | "pick_date";
@@ -130,6 +131,8 @@ export async function handleEditEventCommand(interaction: ChatInputCommandIntera
       const only = events[0];
       registerEditSession(sessionKey, {
         memberDiscordId: interaction.user.id,
+        memberNodeId: member?.id,
+        memberUsername: interaction.user.username,
         events,
         selectedEventId: only.id,
         step: "menu",
@@ -143,6 +146,8 @@ export async function handleEditEventCommand(interaction: ChatInputCommandIntera
 
     registerEditSession(sessionKey, {
       memberDiscordId: interaction.user.id,
+      memberNodeId: member?.id,
+      memberUsername: interaction.user.username,
       events,
       step: "pick_event",
     });
@@ -213,6 +218,8 @@ export async function handleEditEventReply(message: Message, session: EditSessio
       const result = await dbOps.updateEventNode(db, {
         nodeId: selected.id,
         presenterDiscordId: session.memberDiscordId,
+        presenterNodeId: session.memberNodeId,
+        presenterName: session.memberUsername,
         cancel: true,
       });
       if (!result.ok) {
@@ -243,6 +250,8 @@ export async function handleEditEventReply(message: Message, session: EditSessio
     const result = await dbOps.updateEventNode(db, {
       nodeId: selected.id,
       presenterDiscordId: session.memberDiscordId,
+      presenterNodeId: session.memberNodeId,
+      presenterName: session.memberUsername,
       title: `${label}: ${validTitle.title}`,
       description: `Hosted by ${selected.metadata.presenter_name || "presenter"}. ${validTitle.title}`,
       metadataUpdates: selected.eventType === "paper-club"
@@ -265,6 +274,8 @@ export async function handleEditEventReply(message: Message, session: EditSessio
       const result = await dbOps.updateEventNode(db, {
         nodeId: selected.id,
         presenterDiscordId: session.memberDiscordId,
+        presenterNodeId: session.memberNodeId,
+        presenterName: session.memberUsername,
         metadataUpdates: { paper_url: null },
       });
       if (!result.ok) {
@@ -285,6 +296,8 @@ export async function handleEditEventReply(message: Message, session: EditSessio
     const result = await dbOps.updateEventNode(db, {
       nodeId: selected.id,
       presenterDiscordId: session.memberDiscordId,
+      presenterNodeId: session.memberNodeId,
+      presenterName: session.memberUsername,
       metadataUpdates: { paper_url: validUrl.url },
     });
     if (!result.ok) {
@@ -313,6 +326,8 @@ export async function handleEditEventReply(message: Message, session: EditSessio
     const result = await dbOps.updateEventNode(db, {
       nodeId: selected.id,
       presenterDiscordId: session.memberDiscordId,
+      presenterNodeId: session.memberNodeId,
+      presenterName: session.memberUsername,
       eventDate: chosenDate,
     });
     if (!result.ok) {
