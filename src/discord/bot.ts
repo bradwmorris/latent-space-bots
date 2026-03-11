@@ -10,6 +10,7 @@ import {
   BOT_INSTANCE_ID,
   PAPER_CLUB_CHANNEL_ID,
   REMINDERS_ENABLED,
+  REMINDERS_ONE_HOUR_ENABLED,
   REMINDERS_TIMEZONE,
   clientsByProfile,
   db,
@@ -220,6 +221,7 @@ export async function startBot(profile: BotProfile): Promise<void> {
     if (profile.name === "Slop") {
       setupReminders(client, db, {
         enabled: REMINDERS_ENABLED,
+        oneHourEnabled: REMINDERS_ONE_HOUR_ENABLED,
         paperClubChannelId: PAPER_CLUB_CHANNEL_ID,
         instanceId: BOT_INSTANCE_ID,
         timezone: REMINDERS_TIMEZONE,

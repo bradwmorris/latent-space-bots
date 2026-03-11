@@ -354,6 +354,23 @@ export async function getPaperClubEventsForDate(
   db: LibsqlClient,
   targetDate: string
 ): Promise<EventReminderRow[]> {
+  return getPaperClubEventsForDateAndWindow(db, targetDate, "24h");
+}
+
+export async function getPaperClubEventsForDateOneHour(
+  db: LibsqlClient,
+  targetDate: string
+): Promise<EventReminderRow[]> {
+  return getPaperClubEventsForDateAndWindow(db, targetDate, "1h");
+}
+
+async function getPaperClubEventsForDateAndWindow(
+  db: LibsqlClient,
+  targetDate: string,
+  window: "24h" | "1h"
+): Promise<EventReminderRow[]> {
+  const remindedAtField = window === "24h" ? "$.reminded_24h_at" : "$.reminded_1h_at";
+  const claimedAtField = window === "24h" ? "$.reminded_24h_claimed_at" : "$.reminded_1h_claimed_at";
   const result = await db.execute({
     sql: `SELECT id, title, event_date, metadata
           FROM nodes
@@ -361,10 +378,10 @@ export async function getPaperClubEventsForDate(
             AND json_extract(metadata, '$.event_status') = 'scheduled'
             AND json_extract(metadata, '$.event_type') = 'paper-club'
             AND event_date = ?
-            AND json_extract(metadata, '$.reminded_24h_at') IS NULL
+            AND json_extract(metadata, '${remindedAtField}') IS NULL
             AND (
-              json_extract(metadata, '$.reminded_24h_claimed_at') IS NULL
-              OR datetime(json_extract(metadata, '$.reminded_24h_claimed_at')) <= datetime('now', '-3 hours')
+              json_extract(metadata, '${claimedAtField}') IS NULL
+              OR datetime(json_extract(metadata, '${claimedAtField}')) <= datetime('now', '-3 hours')
             )
           ORDER BY event_date ASC`,
     args: [targetDate],
@@ -383,23 +400,43 @@ export async function claimPaperClub24hReminder(
   eventId: number,
   instanceId: string
 ): Promise<boolean> {
+  return claimPaperClubReminder(db, eventId, instanceId, "24h");
+}
+
+export async function claimPaperClub1hReminder(
+  db: LibsqlClient,
+  eventId: number,
+  instanceId: string
+): Promise<boolean> {
+  return claimPaperClubReminder(db, eventId, instanceId, "1h");
+}
+
+async function claimPaperClubReminder(
+  db: LibsqlClient,
+  eventId: number,
+  instanceId: string,
+  window: "24h" | "1h"
+): Promise<boolean> {
   const now = new Date().toISOString();
+  const claimedAtField = window === "24h" ? "$.reminded_24h_claimed_at" : "$.reminded_1h_claimed_at";
+  const claimedByField = window === "24h" ? "$.reminded_24h_claimed_by" : "$.reminded_1h_claimed_by";
+  const remindedAtField = window === "24h" ? "$.reminded_24h_at" : "$.reminded_1h_at";
   const result = await db.execute({
     sql: `UPDATE nodes
           SET metadata = json_set(
                 coalesce(metadata, '{}'),
-                '$.reminded_24h_claimed_at', ?,
-                '$.reminded_24h_claimed_by', ?
+                '${claimedAtField}', ?,
+                '${claimedByField}', ?
               ),
               updated_at = ?
           WHERE id = ?
             AND node_type = 'event'
             AND json_extract(metadata, '$.event_status') = 'scheduled'
             AND json_extract(metadata, '$.event_type') = 'paper-club'
-            AND json_extract(metadata, '$.reminded_24h_at') IS NULL
+            AND json_extract(metadata, '${remindedAtField}') IS NULL
             AND (
-              json_extract(metadata, '$.reminded_24h_claimed_at') IS NULL
-              OR datetime(json_extract(metadata, '$.reminded_24h_claimed_at')) <= datetime('now', '-3 hours')
+              json_extract(metadata, '${claimedAtField}') IS NULL
+              OR datetime(json_extract(metadata, '${claimedAtField}')) <= datetime('now', '-3 hours')
             )`,
     args: [now, instanceId, now, eventId],
   });
@@ -411,17 +448,38 @@ export async function finalizePaperClub24hReminder(
   eventId: number,
   messageId: string
 ): Promise<void> {
+  return finalizePaperClubReminder(db, eventId, messageId, "24h");
+}
+
+export async function finalizePaperClub1hReminder(
+  db: LibsqlClient,
+  eventId: number,
+  messageId: string
+): Promise<void> {
+  return finalizePaperClubReminder(db, eventId, messageId, "1h");
+}
+
+async function finalizePaperClubReminder(
+  db: LibsqlClient,
+  eventId: number,
+  messageId: string,
+  window: "24h" | "1h"
+): Promise<void> {
   const now = new Date().toISOString();
+  const claimedAtField = window === "24h" ? "$.reminded_24h_claimed_at" : "$.reminded_1h_claimed_at";
+  const claimedByField = window === "24h" ? "$.reminded_24h_claimed_by" : "$.reminded_1h_claimed_by";
+  const remindedAtField = window === "24h" ? "$.reminded_24h_at" : "$.reminded_1h_at";
+  const messageIdField = window === "24h" ? "$.reminded_24h_message_id" : "$.reminded_1h_message_id";
   await db.execute({
     sql: `UPDATE nodes
           SET metadata = json_set(
                 json_remove(
                   coalesce(metadata, '{}'),
-                  '$.reminded_24h_claimed_at',
-                  '$.reminded_24h_claimed_by'
+                  '${claimedAtField}',
+                  '${claimedByField}'
                 ),
-                '$.reminded_24h_at', ?,
-                '$.reminded_24h_message_id', ?
+                '${remindedAtField}', ?,
+                '${messageIdField}', ?
               ),
               updated_at = ?
           WHERE id = ?`,
@@ -434,18 +492,38 @@ export async function releasePaperClub24hReminderClaim(
   eventId: number,
   instanceId: string
 ): Promise<void> {
+  return releasePaperClubReminderClaim(db, eventId, instanceId, "24h");
+}
+
+export async function releasePaperClub1hReminderClaim(
+  db: LibsqlClient,
+  eventId: number,
+  instanceId: string
+): Promise<void> {
+  return releasePaperClubReminderClaim(db, eventId, instanceId, "1h");
+}
+
+async function releasePaperClubReminderClaim(
+  db: LibsqlClient,
+  eventId: number,
+  instanceId: string,
+  window: "24h" | "1h"
+): Promise<void> {
   const now = new Date().toISOString();
+  const claimedAtField = window === "24h" ? "$.reminded_24h_claimed_at" : "$.reminded_1h_claimed_at";
+  const claimedByField = window === "24h" ? "$.reminded_24h_claimed_by" : "$.reminded_1h_claimed_by";
+  const remindedAtField = window === "24h" ? "$.reminded_24h_at" : "$.reminded_1h_at";
   await db.execute({
     sql: `UPDATE nodes
           SET metadata = json_remove(
                 coalesce(metadata, '{}'),
-                '$.reminded_24h_claimed_at',
-                '$.reminded_24h_claimed_by'
+                '${claimedAtField}',
+                '${claimedByField}'
               ),
               updated_at = ?
           WHERE id = ?
-            AND json_extract(metadata, '$.reminded_24h_claimed_by') = ?
-            AND json_extract(metadata, '$.reminded_24h_at') IS NULL`,
+            AND json_extract(metadata, '${claimedByField}') = ?
+            AND json_extract(metadata, '${remindedAtField}') IS NULL`,
     args: [now, eventId, instanceId],
   });
 }
