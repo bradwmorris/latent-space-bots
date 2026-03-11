@@ -22,9 +22,10 @@ Paper Club and Builders Club sessions are scheduled via Discord slash commands. 
 
 - `/paper-club` — schedule a Paper Club session
 - `/builders-club` — schedule a Builders Club session
-- `/join` — required before scheduling
+- `/edit-event` — edit title, paper URL, date, or cancel your own scheduled event
+- `/join` — optional; if missing, a profile is auto-created on first scheduling
 
-If someone asks you to schedule an event, direct them to use the slash command.
+If someone asks you to schedule or edit an event, direct them to the slash command.
 
 ## Querying Events
 
