@@ -19,6 +19,13 @@ export type NodeRow = {
   metadata?: unknown;
 };
 
+export type EventReminderRow = {
+  id: number;
+  title: string;
+  event_date: string;
+  metadata: unknown;
+};
+
 type EdgeContext = {
   type: string;
   confidence: number;
@@ -197,6 +204,99 @@ export async function checkEventSlot(
     title: String(row.title || ""),
     presenter: String(row.presenter || "unknown"),
   };
+}
+
+export async function getPaperClubEventsForDate(
+  db: LibsqlClient,
+  targetDate: string
+): Promise<EventReminderRow[]> {
+  const result = await db.execute({
+    sql: `SELECT id, title, event_date, metadata
+          FROM nodes
+          WHERE node_type = 'event'
+            AND json_extract(metadata, '$.event_status') = 'scheduled'
+            AND json_extract(metadata, '$.event_type') = 'paper-club'
+            AND event_date = ?
+            AND json_extract(metadata, '$.reminded_24h_at') IS NULL
+          ORDER BY event_date ASC`,
+    args: [targetDate],
+  });
+
+  return result.rows.map((row) => ({
+    id: Number(row.id),
+    title: String(row.title || ""),
+    event_date: String(row.event_date || ""),
+    metadata: parseMetadata(row.metadata),
+  }));
+}
+
+export async function claimPaperClub24hReminder(
+  db: LibsqlClient,
+  eventId: number,
+  instanceId: string
+): Promise<boolean> {
+  const now = new Date().toISOString();
+  const result = await db.execute({
+    sql: `UPDATE nodes
+          SET metadata = json_set(
+                coalesce(metadata, '{}'),
+                '$.reminded_24h_claimed_at', ?,
+                '$.reminded_24h_claimed_by', ?
+              ),
+              updated_at = ?
+          WHERE id = ?
+            AND node_type = 'event'
+            AND json_extract(metadata, '$.event_status') = 'scheduled'
+            AND json_extract(metadata, '$.event_type') = 'paper-club'
+            AND json_extract(metadata, '$.reminded_24h_at') IS NULL
+            AND json_extract(metadata, '$.reminded_24h_claimed_at') IS NULL`,
+    args: [now, instanceId, now, eventId],
+  });
+  return Number(result.rowsAffected || 0) > 0;
+}
+
+export async function finalizePaperClub24hReminder(
+  db: LibsqlClient,
+  eventId: number,
+  messageId: string
+): Promise<void> {
+  const now = new Date().toISOString();
+  await db.execute({
+    sql: `UPDATE nodes
+          SET metadata = json_set(
+                json_remove(
+                  coalesce(metadata, '{}'),
+                  '$.reminded_24h_claimed_at',
+                  '$.reminded_24h_claimed_by'
+                ),
+                '$.reminded_24h_at', ?,
+                '$.reminded_24h_message_id', ?
+              ),
+              updated_at = ?
+          WHERE id = ?`,
+    args: [now, messageId, now, eventId],
+  });
+}
+
+export async function releasePaperClub24hReminderClaim(
+  db: LibsqlClient,
+  eventId: number,
+  instanceId: string
+): Promise<void> {
+  const now = new Date().toISOString();
+  await db.execute({
+    sql: `UPDATE nodes
+          SET metadata = json_remove(
+                coalesce(metadata, '{}'),
+                '$.reminded_24h_claimed_at',
+                '$.reminded_24h_claimed_by'
+              ),
+              updated_at = ?
+          WHERE id = ?
+            AND json_extract(metadata, '$.reminded_24h_claimed_by') = ?
+            AND json_extract(metadata, '$.reminded_24h_at') IS NULL`,
+    args: [now, eventId, instanceId],
+  });
 }
 
 // ── Edge operations ────────────────────────────────────────────

@@ -12,6 +12,7 @@ Gateway runtime implemented for:
 - Channel allowlist + basic rate limiting
 - Optional chat logging to Turso (`ENABLE_CHAT_LOG_WRITE=true`)
 - Kickoff API (`POST /internal/kickoff`) for announcement → Slop response without mention-trigger dependence
+- Daily Paper Club reminder (day-before at 12:00pm PT; DB-backed idempotency)
 
 ## Slash commands
 
@@ -88,3 +89,14 @@ Behavior:
 - Bot posts a seed message in the target channel.
 - It creates a thread when possible (named `Slop: [title]`).
 - Slop generates a grounded take on the new content and posts it to the thread.
+
+## Event reminder config
+
+Paper Club reminders run once per day at noon Pacific (`America/Los_Angeles`) and post for events scheduled on the next calendar day.
+
+Required/optional env vars:
+
+- `REMINDERS_ENABLED` (default `true`)
+- `PAPER_CLUB_CHANNEL_ID` (required if reminders enabled)
+- `REMINDERS_TIMEZONE` (default `America/Los_Angeles`)
+- `BOT_INSTANCE_ID` (optional; defaults to host/pid)

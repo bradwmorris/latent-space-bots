@@ -5,7 +5,15 @@ import {
   type Interaction,
   type Message
 } from "discord.js";
-import { ALLOWED_CHANNEL_IDS, clientsByProfile } from "../config";
+import {
+  ALLOWED_CHANNEL_IDS,
+  BOT_INSTANCE_ID,
+  PAPER_CLUB_CHANNEL_ID,
+  REMINDERS_ENABLED,
+  REMINDERS_TIMEZONE,
+  clientsByProfile,
+  db,
+} from "../config";
 import { registerSlashCommands } from "../commands/register";
 import { handleJoinCommand } from "../commands/join";
 import { getSchedulingSession, handleScheduleCommand, handleSchedulingReply } from "../commands/schedule";
@@ -19,6 +27,7 @@ import { withinRateLimit } from "./rate-limit";
 import { agenticToolsFooter, modelBadge, splitForDiscord } from "./format";
 import { ensureDestinationChannel } from "./threads";
 import type { BotProfile } from "../types";
+import { setupReminders } from "../reminders";
 
 const processedMessageIds = new Set<string>();
 
@@ -194,6 +203,14 @@ export async function startBot(profile: BotProfile): Promise<void> {
 
   client.once(Events.ClientReady, (readyClient) => {
     console.log(`${profile.name} ready as ${readyClient.user.tag}`);
+    if (profile.name === "Slop") {
+      setupReminders(client, db, {
+        enabled: REMINDERS_ENABLED,
+        paperClubChannelId: PAPER_CLUB_CHANNEL_ID,
+        instanceId: BOT_INSTANCE_ID,
+        timezone: REMINDERS_TIMEZONE,
+      });
+    }
   });
 
   client.on(Events.InteractionCreate, async (interaction) => {
