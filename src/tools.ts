@@ -118,6 +118,21 @@ export const TOOL_DEFINITIONS: OpenAIToolDef[] = [
   {
     type: "function",
     function: {
+      name: "slop_get_upcoming_events",
+      description:
+        "Get upcoming scheduled events from event nodes only. Use this for 'upcoming paper clubs/builders clubs' questions instead of raw SQL. Supports strict event_type filtering.",
+      parameters: {
+        type: "object",
+        properties: {
+          event_type: { type: "string", enum: ["paper-club", "builders-club"], description: "Optional event type filter" },
+          limit: { type: "number", description: "Max events (default 10, max 50)" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "slop_get_context",
       description: "Get wiki-base stats: total nodes, edges, and chunks.",
       parameters: { type: "object", properties: {} },
@@ -219,6 +234,17 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
     execute: async (_args, db) => {
       const context = await dbOps.getContext(db);
       return JSON.stringify(context);
+    },
+  },
+
+  slop_get_upcoming_events: {
+    execute: async (args, db) => {
+      const eventType = (args.event_type === "paper-club" || args.event_type === "builders-club")
+        ? args.event_type
+        : undefined;
+      const limit = Math.min(Math.max(Number(args.limit) || 10, 1), 50);
+      const events = await dbOps.getUpcomingScheduledEvents(db, { eventType, limit });
+      return JSON.stringify({ events, count: events.length });
     },
   },
 

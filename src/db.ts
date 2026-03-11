@@ -33,6 +33,14 @@ export type ScheduledEventRow = {
   metadata: unknown;
 };
 
+export type UpcomingEventRow = {
+  id: number;
+  title: string;
+  event_date: string;
+  event_type: "paper-club" | "builders-club";
+  presenter_name: string;
+};
+
 type EdgeContext = {
   type: string;
   confidence: number;
@@ -352,6 +360,47 @@ export async function getBookedDates(
     map.set(String(row.event_date), String(row.presenter || "someone"));
   }
   return map;
+}
+
+export async function getUpcomingScheduledEvents(
+  db: LibsqlClient,
+  opts: { eventType?: "paper-club" | "builders-club"; limit?: number } = {}
+): Promise<UpcomingEventRow[]> {
+  const where: string[] = [
+    "node_type = 'event'",
+    "json_extract(metadata, '$.event_status') = 'scheduled'",
+    "event_date IS NOT NULL",
+    "event_date >= date('now')",
+  ];
+  const args: Array<string | number> = [];
+  if (opts.eventType) {
+    where.push("json_extract(metadata, '$.event_type') = ?");
+    args.push(opts.eventType);
+  }
+
+  const limit = Math.min(Math.max(Number(opts.limit) || 10, 1), 50);
+  args.push(limit);
+
+  const result = await db.execute({
+    sql: `SELECT id, title, event_date,
+                 json_extract(metadata, '$.event_type') AS event_type,
+                 json_extract(metadata, '$.presenter_name') AS presenter_name
+          FROM nodes
+          WHERE ${where.join(" AND ")}
+          ORDER BY event_date ASC
+          LIMIT ?`,
+    args,
+  });
+
+  return result.rows
+    .map((row) => ({
+      id: Number(row.id),
+      title: String(row.title || ""),
+      event_date: String(row.event_date || ""),
+      event_type: String(row.event_type || "") as "paper-club" | "builders-club",
+      presenter_name: String(row.presenter_name || "unknown"),
+    }))
+    .filter((row) => row.event_type === "paper-club" || row.event_type === "builders-club");
 }
 
 export async function checkEventSlot(

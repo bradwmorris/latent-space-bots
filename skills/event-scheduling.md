@@ -30,12 +30,26 @@ If someone asks you to schedule or edit an event, direct them to the slash comma
 ## Querying Events
 
 **Upcoming events:**
+Use `slop_get_upcoming_events` first.
+
+Type-specific examples:
+
+```json
+{ "event_type": "paper-club", "limit": 10 }
+```
+
+```json
+{ "event_type": "builders-club", "limit": 10 }
+```
+
+If you must use SQL:
 ```sql
 SELECT id, title, event_date, json_extract(metadata, '$.event_type') as type,
        json_extract(metadata, '$.presenter_name') as presenter
 FROM nodes
 WHERE node_type = 'event'
   AND json_extract(metadata, '$.event_status') = 'scheduled'
+  AND json_extract(metadata, '$.event_type') = 'paper-club' -- or builders-club
 ORDER BY event_date ASC
 ```
 
