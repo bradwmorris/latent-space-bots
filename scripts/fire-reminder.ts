@@ -37,7 +37,7 @@ client.once("ready", async () => {
   }
 
   await (channel as any).send({
-    content: `📅 **Paper Club tomorrow (12pm PT)**\n\n${mention} is presenting: **${event.title}**${paperLine}`,
+    content: `📅 **Paper Club tomorrow**\n\n${mention} is presenting: **${event.title}**${paperLine}`,
     allowedMentions: { parse: ["users"] },
   });
 
