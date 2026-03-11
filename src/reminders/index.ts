@@ -136,14 +136,14 @@ export function setupReminders(client: DiscordClient, db: LibsqlClient, config: 
   cron.schedule("0 12 * * *", async () => {
     const targetDate = getTomorrowDateInTimeZone(config.timezone);
     console.log(`[reminders] Checking 24h paper-club reminders for event_date=${targetDate}`);
-    await runReminderJob("24h", targetDate, "Paper Club tomorrow (12pm PT)");
+    await runReminderJob("24h", targetDate, "Paper Club tomorrow");
   }, { timezone: config.timezone });
 
   if (config.oneHourEnabled) {
     cron.schedule("0 11 * * *", async () => {
       const targetDate = getTodayDateInTimeZone(config.timezone);
       console.log(`[reminders] Checking 1h paper-club reminders for event_date=${targetDate}`);
-      await runReminderJob("1h", targetDate, "Paper Club in 1 hour (12pm PT)");
+      await runReminderJob("1h", targetDate, "Paper Club in 1 hour");
     }, { timezone: config.timezone });
   }
 
