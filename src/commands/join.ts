@@ -6,6 +6,29 @@ import { logTrace } from "../llm/tracing";
 import type { ChatInputCommandInteraction } from "discord.js";
 
 const joinInFlight = new Set<string>();
+const DB_TIMEOUT_MS = 10_000;
+
+function safeAvatarUrl(interaction: ChatInputCommandInteraction): string | undefined {
+  try {
+    return interaction.user.displayAvatarURL({ size: 256, extension: "png" });
+  } catch {
+    return undefined;
+  }
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timeout`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 export async function handleJoinCommand(
   profile: BotProfile,
@@ -19,18 +42,26 @@ export async function handleJoinCommand(
   }
   joinInFlight.add(interaction.user.id);
   try {
-    const existing = await lookupMember(interaction.user.id);
+    const existing = await withTimeout(lookupMember(interaction.user.id), DB_TIMEOUT_MS, "lookupMember");
     if (existing) {
       const refreshedMetadata: MemberMetadata = {
         ...existing.metadata,
         discord_id: interaction.user.id,
         discord_handle: interaction.user.username,
-        avatar_url: interaction.user.displayAvatarURL({ size: 256, extension: "png" }),
+        avatar_url: safeAvatarUrl(interaction) || existing.metadata.avatar_url,
         last_active: new Date().toISOString()
       };
-      await dbOps.updateMemberNode(db, existing.id, {
+      let rows = await withTimeout(dbOps.updateMemberNode(db, existing.id, {
         metadata: refreshedMetadata as Record<string, unknown>
-      });
+      }), DB_TIMEOUT_MS, "updateMemberNode");
+      if (rows === 0) {
+        rows = await withTimeout(dbOps.updateMemberNode(db, existing.id, {
+          metadata: refreshedMetadata as Record<string, unknown>
+        }), DB_TIMEOUT_MS, "updateMemberNode retry");
+      }
+      if (rows === 0) {
+        throw new Error("member metadata update had no effect");
+      }
       const reply = `You're already in the graph. I've been tracking your interests since ${existing.metadata.joined_at}.`;
       await interaction.editReply(reply);
       await logTrace(profile, traceSource, "/join", reply, {
@@ -41,7 +72,7 @@ export async function handleJoinCommand(
     }
 
     try {
-      const newMember = await createMemberNodeFromUser(interaction.user);
+      const newMember = await withTimeout(createMemberNodeFromUser(interaction.user), DB_TIMEOUT_MS, "createMemberNodeFromUser");
       const reply = "You're in the graph. As we chat, I'll learn what you're into and connect you to relevant content.";
       await interaction.editReply(reply);
       await logTrace(profile, traceSource, "/join", reply, {
@@ -49,18 +80,26 @@ export async function handleJoinCommand(
         is_slash_command: true, slash_command: "join", is_kickoff: false, latency_ms: Date.now() - startTime
       });
     } catch (createError) {
-      const raced = await lookupMember(interaction.user.id);
+      const raced = await withTimeout(lookupMember(interaction.user.id), DB_TIMEOUT_MS, "lookupMember after create");
       if (raced && isUniqueConstraintError(createError)) {
         const refreshedMetadata: MemberMetadata = {
           ...raced.metadata,
           discord_id: interaction.user.id,
           discord_handle: interaction.user.username,
-          avatar_url: interaction.user.displayAvatarURL({ size: 256, extension: "png" }),
+          avatar_url: safeAvatarUrl(interaction) || raced.metadata.avatar_url,
           last_active: new Date().toISOString()
         };
-        await dbOps.updateMemberNode(db, raced.id, {
+        let rows = await withTimeout(dbOps.updateMemberNode(db, raced.id, {
           metadata: refreshedMetadata as Record<string, unknown>
-        });
+        }), DB_TIMEOUT_MS, "updateMemberNode raced");
+        if (rows === 0) {
+          rows = await withTimeout(dbOps.updateMemberNode(db, raced.id, {
+            metadata: refreshedMetadata as Record<string, unknown>
+          }), DB_TIMEOUT_MS, "updateMemberNode raced retry");
+        }
+        if (rows === 0) {
+          throw new Error("member metadata update had no effect");
+        }
         const reply = `You're already in the graph. I've been tracking your interests since ${raced.metadata.joined_at}.`;
         await interaction.editReply(reply);
         await logTrace(profile, traceSource, "/join", reply, {
@@ -73,7 +112,11 @@ export async function handleJoinCommand(
     }
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    await interaction.editReply(`Couldn't add you to the graph right now: ${msg}`);
+    if (/timeout/i.test(msg)) {
+      await interaction.editReply("Database is slow right now. Please try `/join` again in a moment.");
+      return;
+    }
+    await interaction.editReply("Something went wrong. Try `/join` again in a moment. If it keeps failing, let us know in #support.");
   } finally {
     joinInFlight.delete(interaction.user.id);
   }

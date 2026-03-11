@@ -17,6 +17,7 @@ import {
 import { registerSlashCommands } from "../commands/register";
 import { handleJoinCommand } from "../commands/join";
 import { getSchedulingSession, handleScheduleCommand, handleSchedulingReply } from "../commands/schedule";
+import { getEditEventSession, handleEditEventCommand, handleEditEventReply } from "../commands/edit-event";
 import { clearTraces, getToolTracesSnapshot, logTrace } from "../llm/tracing";
 import { buildSystemPrompt, parseProfileBlock } from "../llm/prompts";
 import { generateAgenticResponse, generateResponse } from "../llm/generate";
@@ -51,6 +52,14 @@ export async function handleMessage(client: Client, profile: BotProfile, message
     if (processedMessageIds.has(dedupeKey)) return;
     processedMessageIds.add(dedupeKey);
     await handleSchedulingReply(profile, message, schedulingSession);
+    return;
+  }
+
+  const editSession = getEditEventSession(message.channelId);
+  if (editSession && message.author.id === editSession.memberDiscordId) {
+    if (processedMessageIds.has(dedupeKey)) return;
+    processedMessageIds.add(dedupeKey);
+    await handleEditEventReply(message, editSession);
     return;
   }
 
@@ -181,7 +190,7 @@ export async function handleInteraction(client: Client, profile: BotProfile, int
   clearTraces();
   const startTime = Date.now();
   const traceSource = { userId: interaction.user.id, username: interaction.user.username, channelId: interaction.channelId || "", messageId: interaction.id };
-  const command = interaction.commandName as "join" | "paper-club" | "builders-club";
+  const command = interaction.commandName as "join" | "paper-club" | "builders-club" | "edit-event";
   await interaction.deferReply();
 
   if (command === "join") {
@@ -191,6 +200,11 @@ export async function handleInteraction(client: Client, profile: BotProfile, int
 
   if (command === "paper-club" || command === "builders-club") {
     await handleScheduleCommand(profile, interaction, command);
+    return;
+  }
+
+  if (command === "edit-event") {
+    await handleEditEventCommand(interaction);
     return;
   }
 }

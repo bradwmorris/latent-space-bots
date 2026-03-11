@@ -36,6 +36,7 @@ export const DEBATE_KICKOFF_PORT = Number(process.env.DEBATE_KICKOFF_PORT || 878
 export const DEBATE_KICKOFF_HOST = process.env.DEBATE_KICKOFF_HOST || "0.0.0.0";
 export const BOT_TALK_CHANNEL_ID = process.env.BOT_TALK_CHANNEL_ID || "";
 export const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+export const HUB_BASE_URL = process.env.HUB_BASE_URL || "https://latent-space-hub.vercel.app";
 export const REMINDERS_ENABLED = boolFromEnv(process.env.REMINDERS_ENABLED, true);
 export const PAPER_CLUB_CHANNEL_ID = process.env.PAPER_CLUB_CHANNEL_ID || "";
 export const REMINDERS_TIMEZONE = process.env.REMINDERS_TIMEZONE || "America/Los_Angeles";

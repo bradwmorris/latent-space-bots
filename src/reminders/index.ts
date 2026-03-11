@@ -86,6 +86,7 @@ export function setupReminders(client: DiscordClient, db: LibsqlClient, config: 
             ? `\n\nReview the paper and come prepared with questions:\n${paperUrl}`
             : "";
 
+          let sentMessageId = "";
           try {
             const sent = await sendChannel.send({
               content:
@@ -93,11 +94,18 @@ export function setupReminders(client: DiscordClient, db: LibsqlClient, config: 
                 `${presenterMention} is presenting: **${event.title}**${paperLine}`,
               allowedMentions: { parse: ["users"] },
             });
-            await finalizePaperClub24hReminder(db, event.id, sent.id);
-            console.log(`[reminders] Sent reminder for event=${event.id}`);
+            sentMessageId = sent.id;
           } catch (error) {
             await releasePaperClub24hReminderClaim(db, event.id, config.instanceId);
             console.error(`[reminders] Failed sending reminder for event=${event.id}:`, error);
+            continue;
+          }
+
+          try {
+            await finalizePaperClub24hReminder(db, event.id, sentMessageId);
+            console.log(`[reminders] Sent reminder for event=${event.id}`);
+          } catch (error) {
+            console.error(`[reminders] Reminder sent but finalize failed for event=${event.id}:`, error);
           }
         }
       } catch (error) {

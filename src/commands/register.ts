@@ -18,6 +18,9 @@ export async function registerSlashCommands(profile: BotProfile): Promise<void> 
     new SlashCommandBuilder()
       .setName("builders-club")
       .setDescription("Schedule a Builders Club session — pick a date and topic"),
+    new SlashCommandBuilder()
+      .setName("edit-event")
+      .setDescription("Edit or cancel one of your scheduled events"),
   ].map((c) => c.toJSON());
 
   const rest = new REST({ version: "10" }).setToken(profile.token);

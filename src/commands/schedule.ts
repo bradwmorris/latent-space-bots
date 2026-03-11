@@ -1,24 +1,59 @@
-import { ThreadAutoArchiveDuration, type ChatInputCommandInteraction, type Message } from "discord.js";
+import {
+  ThreadAutoArchiveDuration,
+  type ChatInputCommandInteraction,
+  type Message,
+} from "discord.js";
 import * as dbOps from "../db";
-import { db } from "../config";
-import { lookupMember, createMemberNodeFromUser } from "../members";
+import { db, HUB_BASE_URL } from "../config";
+import { createMemberNodeFromUser, lookupMember } from "../members";
 import { logTrace } from "../llm/tracing";
 import type { BotProfile, SchedulingSession } from "../types";
+import { getNextDatesForDay } from "./schedulingDates";
+import { validateEventDate, validateEventTitle, validatePaperUrl } from "./validation";
 
 const schedulingSessions = new Map<string, SchedulingSession>();
+const schedulingInFlight = new Set<string>();
+const sessionTimeouts = new Map<string, NodeJS.Timeout>();
+const warningTimeouts = new Map<string, NodeJS.Timeout>();
 
-function getNextDatesForDay(targetDay: number, count: number): string[] {
-  const dates: string[] = [];
-  const d = new Date();
-  d.setUTCHours(12, 0, 0, 0);
-  d.setUTCDate(d.getUTCDate() + 1);
-  while (dates.length < count) {
-    if (d.getUTCDay() === targetDay) {
-      dates.push(d.toISOString().slice(0, 10));
-    }
-    d.setUTCDate(d.getUTCDate() + 1);
-  }
-  return dates;
+const SESSION_TIMEOUT_MS = 10 * 60 * 1000;
+const WARNING_TIMEOUT_MS = 8 * 60 * 1000;
+
+function clearSessionTimers(sessionKey: string): void {
+  const timeout = sessionTimeouts.get(sessionKey);
+  if (timeout) clearTimeout(timeout);
+  sessionTimeouts.delete(sessionKey);
+
+  const warning = warningTimeouts.get(sessionKey);
+  if (warning) clearTimeout(warning);
+  warningTimeouts.delete(sessionKey);
+}
+
+function clearSchedulingSession(sessionKey: string): void {
+  schedulingSessions.delete(sessionKey);
+  clearSessionTimers(sessionKey);
+}
+
+function registerSchedulingSession(sessionKey: string, session: SchedulingSession, channelIdForWarning: string): void {
+  schedulingSessions.set(sessionKey, session);
+
+  const warningTimer = setTimeout(() => {
+    const active = schedulingSessions.get(sessionKey);
+    if (!active) return;
+    const client = active.clientRef;
+    if (!client) return;
+    client.channels.fetch(channelIdForWarning).then((channel) => {
+      if (channel && channel.isTextBased() && "send" in channel) {
+        void channel.send("Heads up: this scheduling session expires in 2 minutes. Reply now to continue.");
+      }
+    }).catch(() => {});
+  }, WARNING_TIMEOUT_MS);
+  warningTimeouts.set(sessionKey, warningTimer);
+
+  const timeoutTimer = setTimeout(() => {
+    clearSchedulingSession(sessionKey);
+  }, SESSION_TIMEOUT_MS);
+  sessionTimeouts.set(sessionKey, timeoutTimer);
 }
 
 export function getSchedulingSession(channelId: string): SchedulingSession | undefined {
@@ -30,10 +65,17 @@ export async function handleScheduleCommand(
   interaction: ChatInputCommandInteraction,
   command: "paper-club" | "builders-club"
 ): Promise<void> {
+  const inFlightKey = `${interaction.user.id}:${command}`;
+  if (schedulingInFlight.has(inFlightKey)) {
+    await interaction.editReply(`You already have a ${command} scheduling flow in progress.`);
+    return;
+  }
+  schedulingInFlight.add(inFlightKey);
+
   try {
     let member = await lookupMember(interaction.user.id);
     if (!member) {
-      const created = await createMemberNodeFromUser(interaction.user);
+      await createMemberNodeFromUser(interaction.user);
       member = await lookupMember(interaction.user.id);
       if (!member) {
         await interaction.editReply("Couldn't create your profile. Try again or run `/join` first.");
@@ -50,27 +92,30 @@ export async function handleScheduleCommand(
     const available = nextDates.filter((d) => !booked.has(d)).slice(0, 4);
 
     if (!available.length) {
-      await interaction.editReply(`All upcoming ${label} slots are booked! Try again later.`);
+      await interaction.editReply(`All upcoming ${label} slots are booked. Try again later.`);
       return;
     }
 
     const dayLabel = isPaperClub ? "Wed" : "Fri";
     const lines = available.map((d, i) => {
-      const date = new Date(d + "T12:00:00Z");
+      const date = new Date(`${d}T12:00:00Z`);
       const month = date.toLocaleString("en-US", { month: "short", timeZone: "UTC" });
       const day = date.getUTCDate();
       return `**${i + 1}.** ${dayLabel} ${month} ${day} (${d})`;
     });
 
     const prompt = isPaperClub
-      ? "Reply with the **number** of the date you want, and the **paper title** (and optionally a URL)."
+      ? "Reply with the **number** of the date you want, and the **paper title** (optionally with URL)."
       : "Reply with the **number** of the date you want, and your **topic**.";
 
-    const reply = `**Schedule a ${label} session**\n\nAvailable dates:\n${lines.join("\n")}\n\n${prompt}`;
+    const message = await interaction.editReply(
+      `**Schedule a ${label} session**\n\nAvailable dates:\n${lines.join("\n")}\n\n${prompt}`
+    );
 
-    const message = await interaction.editReply(reply);
+    let sessionKey = interaction.channelId || "";
+    let warningChannelId = interaction.channelId || "";
+    let usingFallbackChannel = true;
 
-    let threadId: string;
     try {
       const channel = interaction.channel;
       if (channel && "threads" in channel && channel.threads) {
@@ -80,37 +125,46 @@ export async function handleScheduleCommand(
           startMessage: message.id,
           reason: `${label} scheduling thread`,
         });
-        threadId = thread.id;
-      } else {
-        threadId = interaction.channelId || "";
+        sessionKey = thread.id;
+        warningChannelId = thread.id;
+        usingFallbackChannel = false;
       }
     } catch {
-      threadId = interaction.channelId || "";
+      // Falls back to the interaction channel.
     }
 
-    schedulingSessions.set(threadId, {
+    if (usingFallbackChannel && schedulingSessions.has(sessionKey)) {
+      await interaction.followUp("Another scheduling session is active in this channel. Try again in a few minutes.");
+      return;
+    }
+
+    registerSchedulingSession(sessionKey, {
       eventType: command,
       memberId: member.id,
       memberDiscordId: interaction.user.id,
       memberUsername: interaction.user.username,
       availableDates: available,
       step: "pick_date",
-    });
-
-    setTimeout(() => schedulingSessions.delete(threadId), 10 * 60 * 1000);
+      clientRef: interaction.client,
+    }, warningChannelId);
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     await interaction.editReply(`Couldn't start scheduling: ${msg}`);
+  } finally {
+    schedulingInFlight.delete(inFlightKey);
   }
 }
 
-export async function handleSchedulingReply(profile: BotProfile, message: Message, session: SchedulingSession): Promise<void> {
+export async function handleSchedulingReply(
+  profile: BotProfile,
+  message: Message,
+  session: SchedulingSession
+): Promise<void> {
   const text = message.content.trim();
   const isPaperClub = session.eventType === "paper-club";
-  const label = isPaperClub ? "Paper Club" : "Builders Club";
 
   if (session.step === "pick_date") {
-    const match = text.match(/^(\d)\s*(.*)/s);
+    const match = text.trim().match(/^(\d)\s*(.*)/s);
     if (!match) {
       await message.reply(`Reply with a number (1-${session.availableDates.length}) to pick a date.`);
       return;
@@ -132,22 +186,25 @@ export async function handleSchedulingReply(profile: BotProfile, message: Messag
 
     session.chosenDate = chosenDate;
     session.step = "pick_title";
-    const dateLabel = new Date(chosenDate + "T12:00:00Z").toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
+    const dateLabel = new Date(`${chosenDate}T12:00:00Z`).toLocaleDateString("en-US", {
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+      timeZone: "UTC",
+    });
     const ask = isPaperClub
-      ? `Got it — **${dateLabel}**. What paper are you presenting? (title, and optionally a URL)`
-      : `Got it — **${dateLabel}**. What's your topic?`;
+      ? `Got it: **${dateLabel}**. What paper are you presenting? (title, optionally URL)`
+      : `Got it: **${dateLabel}**. What's your topic?`;
     await message.reply(ask);
     return;
   }
 
   if (session.step === "pick_title") {
     if (!text) {
-      const ask = isPaperClub ? "What paper are you presenting?" : "What's your topic?";
-      await message.reply(ask);
+      await message.reply(isPaperClub ? "What paper are you presenting?" : "What's your topic?");
       return;
     }
     await createScheduledEvent(profile, message, session, session.chosenDate!, text);
-    return;
   }
 }
 
@@ -162,20 +219,37 @@ async function createScheduledEvent(
   const label = isPaperClub ? "Paper Club" : "Builders Club";
 
   try {
+    const dateValidation = validateEventDate(dateStr, session.eventType);
+    if (!dateValidation.valid) {
+      await message.reply(dateValidation.error || "That date is not valid anymore. Please restart scheduling.");
+      return;
+    }
+
     let paperUrl: string | undefined;
-    let cleanTitle = titleText;
+    let rawTitle = titleText;
     if (isPaperClub) {
       const urlMatch = titleText.match(/(https?:\/\/\S+)/);
       if (urlMatch) {
-        paperUrl = urlMatch[1];
-        cleanTitle = titleText.replace(urlMatch[0], "").trim();
+        const validUrl = validatePaperUrl(urlMatch[1]);
+        if (!validUrl.valid) {
+          await message.reply(validUrl.error || "Paper URL is invalid.");
+          return;
+        }
+        paperUrl = validUrl.url;
+        rawTitle = titleText.replace(urlMatch[0], "").trim();
       }
     }
 
-    const title = `${label}: ${cleanTitle}`;
-    const eventPayload: Parameters<typeof dbOps.createEventNode>[1] = isPaperClub
+    const titleValidation = validateEventTitle(rawTitle);
+    if (!titleValidation.valid) {
+      await message.reply(titleValidation.error || "Title is invalid.");
+      return;
+    }
+    const cleanTitle = titleValidation.title;
+
+    const eventPayload: Parameters<typeof dbOps.createEventNodeAtomic>[1] = isPaperClub
       ? {
-          title,
+          title: `${label}: ${cleanTitle}`,
           description: `Hosted by ${session.memberUsername}. ${cleanTitle}`,
           event_date: dateStr,
           event_type: "paper-club",
@@ -186,7 +260,7 @@ async function createScheduledEvent(
           paper_url: paperUrl,
         }
       : {
-          title,
+          title: `${label}: ${cleanTitle}`,
           description: `Hosted by ${session.memberUsername}. ${cleanTitle}`,
           event_date: dateStr,
           event_type: "builders-club",
@@ -196,23 +270,45 @@ async function createScheduledEvent(
           topic: cleanTitle,
         };
 
-    const eventNode = await dbOps.createEventNode(db, eventPayload);
-    await dbOps.createEdge(db, session.memberId, eventNode.id, `hosting ${label} session`);
+    const created = await dbOps.createEventNodeAtomic(db, eventPayload);
+    if (created.alreadyBooked) {
+      await message.reply("That slot was just taken. Pick another date with `/paper-club` or `/builders-club`.");
+      clearSchedulingSession(message.channelId);
+      return;
+    }
 
-    const dateLabel = new Date(dateStr + "T12:00:00Z").toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
-    const reply = `**${label} scheduled!**\n📅 ${dateLabel}\n📝 ${cleanTitle}\n🎤 ${session.memberUsername}`;
+    await dbOps.createEdge(db, session.memberId, created.nodeId, `hosting ${label} session`);
+
+    const dateLabel = new Date(`${dateStr}T12:00:00Z`).toLocaleDateString("en-US", {
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+      timeZone: "UTC",
+    });
+    const deepLink = `${HUB_BASE_URL}/?type=${session.eventType}`;
+    const reply = `**${label} scheduled!**\n📅 ${dateLabel}\n📝 ${cleanTitle}\n🎤 ${session.memberUsername}\n\n[View in the Hub](${deepLink})`;
     await message.reply(reply);
 
-    schedulingSessions.delete(message.channelId);
+    clearSchedulingSession(message.channelId);
 
-    const traceSource = { userId: session.memberDiscordId, username: session.memberUsername, channelId: message.channelId, messageId: message.id };
+    const traceSource = {
+      userId: session.memberDiscordId,
+      username: session.memberUsername,
+      channelId: message.channelId,
+      messageId: message.id,
+    };
     await logTrace(profile, traceSource, `/${session.eventType}`, reply, {
-      retrieval_method: "event_create", context_node_ids: [eventNode.id], member_id: session.memberId,
-      is_slash_command: true, slash_command: session.eventType, is_kickoff: false, latency_ms: 0
+      retrieval_method: "event_create",
+      context_node_ids: [created.nodeId],
+      member_id: session.memberId,
+      is_slash_command: true,
+      slash_command: session.eventType,
+      is_kickoff: false,
+      latency_ms: 0,
     });
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     await message.reply(`Couldn't create the event: ${msg}`);
-    schedulingSessions.delete(message.channelId);
+    clearSchedulingSession(message.channelId);
   }
 }
