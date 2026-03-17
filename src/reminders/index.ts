@@ -97,13 +97,14 @@ export function setupReminders(client: DiscordClient, db: LibsqlClient, config: 
         const paperLine = paperUrl
           ? `\n\nReview the paper and come prepared with questions:\n${paperUrl}`
           : "";
+        const notesLine = event.notes ? `\n\n${event.notes}` : "";
 
         let sentMessageId = "";
         try {
           const sent = await sendChannel.send({
             content:
               `📅 **${headline}**\n\n` +
-              `${presenterMention} is presenting: **${event.title}**${paperLine}`,
+              `${presenterMention} is presenting: **${event.title}**${paperLine}${notesLine}`,
             allowedMentions: { parse: ["users"] },
           });
           sentMessageId = sent.id;

@@ -23,7 +23,7 @@ type EditSession = {
   memberUsername?: string;
   events: EditableEvent[];
   selectedEventId?: number;
-  step: "pick_event" | "menu" | "edit_title" | "edit_url" | "pick_date";
+  step: "pick_event" | "menu" | "edit_title" | "edit_url" | "edit_notes" | "pick_date";
   dateOptions?: string[];
 };
 
@@ -56,7 +56,7 @@ function formatEventLine(event: EditableEvent, idx: number): string {
 
 function menuPrompt(eventType: "paper-club" | "builders-club"): string {
   if (eventType === "paper-club") {
-    return "Reply with:\n`1` change title\n`2` change paper URL\n`3` reschedule date\n`4` cancel event\n`5` done";
+    return "Reply with:\n`1` change title\n`2` change paper URL\n`3` reschedule date\n`4` add/update notes & supplementary links\n`5` cancel event\n`6` done";
   }
   return "Reply with:\n`1` change title\n`2` reschedule date\n`3` cancel event\n`4` done";
 }
@@ -199,9 +199,20 @@ export async function handleEditEventReply(message: Message, session: EditSessio
     }
 
     const rescheduleChoice = selected.eventType === "paper-club" ? "3" : "2";
-    const cancelChoice = selected.eventType === "paper-club" ? "4" : "3";
-    const doneChoice = selected.eventType === "paper-club" ? "5" : "4";
+    const notesChoice = selected.eventType === "paper-club" ? "4" : null;
+    const cancelChoice = selected.eventType === "paper-club" ? "5" : "3";
+    const doneChoice = selected.eventType === "paper-club" ? "6" : "4";
 
+    if (notesChoice && text === notesChoice) {
+      session.step = "edit_notes";
+      const current = typeof selected.metadata.notes === "string" && selected.metadata.notes
+        ? `\n\nCurrent notes:\n${selected.metadata.notes}`
+        : "";
+      await message.reply(
+        `Send your notes for attendees. You can include a message, supplementary links, background reading — anything helpful.${current}\n\nSend \`clear\` to remove existing notes.`
+      );
+      return;
+    }
     if (text === rescheduleChoice) {
       const targetDay = selected.eventType === "paper-club" ? 3 : 5;
       const nextDates = getNextDatesForDay(targetDay, 8);
@@ -307,6 +318,26 @@ export async function handleEditEventReply(message: Message, session: EditSessio
     }
     session.step = "menu";
     await message.reply(`Paper URL updated.\n\n${menuPrompt(selected.eventType)}`);
+    return;
+  }
+
+  if (session.step === "edit_notes") {
+    const newNotes = text.toLowerCase() === "clear" ? null : text;
+    const result = await dbOps.updateEventNode(db, {
+      nodeId: selected.id,
+      presenterDiscordId: session.memberDiscordId,
+      presenterNodeId: session.memberNodeId,
+      presenterName: session.memberUsername,
+      notes: newNotes,
+    });
+    if (!result.ok) {
+      await message.reply("Couldn't update notes.");
+      clearEditSession(message.channelId);
+      return;
+    }
+    session.step = "menu";
+    const confirm = newNotes === null ? "Notes cleared." : "Notes updated.";
+    await message.reply(`${confirm}\n\n${menuPrompt(selected.eventType)}`);
     return;
   }
 

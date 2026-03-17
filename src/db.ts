@@ -23,6 +23,7 @@ export type EventReminderRow = {
   id: number;
   title: string;
   event_date: string;
+  notes: string | null;
   metadata: unknown;
 };
 
@@ -261,6 +262,7 @@ export async function updateEventNode(
     title?: string;
     description?: string;
     eventDate?: string;
+    notes?: string | null;
     metadataUpdates?: Record<string, unknown>;
     cancel?: boolean;
   }
@@ -313,6 +315,10 @@ export async function updateEventNode(
   if (params.description !== undefined) {
     setClauses.push("description = ?");
     args.push(params.description);
+  }
+  if (params.notes !== undefined) {
+    setClauses.push("notes = ?");
+    args.push(params.notes);
   }
   if (params.eventDate !== undefined) {
     setClauses.push("event_date = ?");
@@ -449,7 +455,7 @@ async function getPaperClubEventsForDateAndWindow(
   const remindedAtField = window === "24h" ? "$.reminded_24h_at" : "$.reminded_1h_at";
   const claimedAtField = window === "24h" ? "$.reminded_24h_claimed_at" : "$.reminded_1h_claimed_at";
   const result = await db.execute({
-    sql: `SELECT id, title, event_date, metadata
+    sql: `SELECT id, title, event_date, notes, metadata
           FROM nodes
           WHERE node_type = 'event'
             AND json_extract(metadata, '$.event_status') = 'scheduled'
@@ -468,6 +474,7 @@ async function getPaperClubEventsForDateAndWindow(
     id: Number(row.id),
     title: String(row.title || ""),
     event_date: String(row.event_date || ""),
+    notes: row.notes == null ? null : String(row.notes),
     metadata: parseMetadata(row.metadata),
   }));
 }
