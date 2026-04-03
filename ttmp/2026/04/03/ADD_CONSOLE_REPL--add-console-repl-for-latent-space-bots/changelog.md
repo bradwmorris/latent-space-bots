@@ -54,3 +54,15 @@ Step 4: add local SQLite bootstrap path for the REPL and validate /join against 
 - /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/scripts/init-local-db.cjs — Local SQLite schema bootstrap
 - /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/config.ts — Local file DB auth handling
 
+
+## 2026-04-03
+
+Step 5: remove the Discord token requirement from console REPL startup and validate the launcher with `BOT_TOKEN_SLOP` unset (commit 30391fea050c12d6cc5bf64c095f3768673b9340)
+
+### Related Files
+
+- /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/README.md — Clarified that the REPL does not require BOT_TOKEN_SLOP but the Discord bot still does
+- /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/adapters/console/repl.ts — Uses a runtime-only local profile for the console adapter
+- /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/config.ts — Profile config no longer throws at import time when BOT_TOKEN_SLOP is absent
+- /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/discord/bot.ts — Preserves the real token requirement at Discord login time
+- /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/index.ts — Filters tokenless profiles out of bot startup

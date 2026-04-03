@@ -29,12 +29,21 @@ RelatedFiles:
       Note: |-
         Local file-based libsql URLs no longer require TURSO_AUTH_TOKEN
         Allows file-based libsql URLs to omit TURSO_AUTH_TOKEN
+    - Path: src/discord/bot.ts
+      Note: |-
+        Discord startup still requires a real token even though the REPL does not
+        Discord startup still requires a token even though the REPL does not
+    - Path: src/index.ts
+      Note: |-
+        Main bot startup filters out tokenless profiles before attempting login
+        Main startup now filters profiles without login tokens
 ExternalSources: []
 Summary: Implementation diary for the transport/runtime refactor and local console REPL work.
-LastUpdated: 2026-04-03T14:19:00-07:00
+LastUpdated: 2026-04-03T14:24:00-07:00
 WhatFor: Capture the implementation journey, validation, risks, and review guidance for the console REPL and transport refactor.
 WhenToUse: Use when continuing implementation or reviewing completed phases of the ticket.
 ---
+
 
 
 
@@ -395,3 +404,85 @@ I added a repo-local schema bootstrap script and relaxed config so local `file:`
 - Failed prototype commands that shaped the final implementation:
   - `npm run db:init:local -- /tmp/latent-space-bots-local.db` when it still used `tsx`
   - `node dist/scripts/init-local-db.js /tmp/latent-space-bots-local.db`
+
+## Step 5: Remove The Discord Token Requirement From Console REPL Startup
+
+Once the local DB path existed, the next friction point was that the console REPL still required `BOT_TOKEN_SLOP` even though it never logs into Discord. The first fix only removed the direct config import from the REPL entrypoint, but the shared runtime still imported `config` transitively through the LLM and tool stack, so the built REPL kept failing at module load before the prompt even appeared.
+
+I moved the token requirement to the actual Discord startup boundary instead of the shared runtime boundary. That keeps the REPL and the runtime usable with only `TURSO_DATABASE_URL` and `OPENROUTER_API_KEY`, while the production bot still fails fast if someone tries to start Discord without a real token.
+
+### Prompt Context
+
+**User prompt (verbatim):** "Please change the token to not be required when running through the repl. Keep a diary and commit that change"
+
+**Assistant interpretation:** Remove the need for `BOT_TOKEN_SLOP` in the console REPL path without weakening the Discord bot startup contract, document the change in the ticket diary, and commit it.
+
+**Inferred user intent:** The user wants the local REPL to be a lightweight development tool that does not depend on unrelated Discord credentials.
+
+**Commit (code):** 30391fea050c12d6cc5bf64c095f3768673b9340 — "fix(repl): remove bot token requirement from local console startup"
+
+### What I did
+- Replaced the REPL’s dependency on `getProfileByName("Slop")` in [`src/adapters/console/repl.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/adapters/console/repl.ts) with a runtime-only local `BotProfile` that uses the configured model but does not require a Discord token.
+- Updated [`src/config.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/config.ts) so profile definition no longer throws at module import time when `BOT_TOKEN_SLOP` is unset.
+- Updated [`src/index.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/index.ts) to start only profiles that actually have login tokens.
+- Added an explicit guard in [`src/discord/bot.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/discord/bot.ts) so Discord startup still fails loudly if a tokenless profile is passed to `startBot`.
+- Clarified the behavior in [`README.md`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/README.md): no token for the REPL, token still required for the real bot.
+- Validated the exact tokenless path:
+  - `npm run build`
+  - `npm test`
+  - `TURSO_DATABASE_URL='file:/tmp/latent-space-bots-local.db' OPENROUTER_API_KEY='test-key' env -u BOT_TOKEN_SLOP ./bin/ls-chat`
+  - in session: `/join`, `/quit`
+
+### Why
+- The console REPL is a local transport for testing the shared runtime, not a Discord client.
+- Requiring a Discord token for module import was the wrong boundary and made local development more fragile than it needed to be.
+- The token requirement still belongs at the place where the app actually registers slash commands and calls `client.login(...)`.
+
+### What worked
+- Moving the guard from config import to startup behavior preserved the production safety check while unblocking local REPL usage.
+- The no-token REPL path now starts cleanly and can use the local DB-backed `/join` flow.
+- The existing test suite and build both stayed green after the change.
+
+### What didn't work
+- My first attempt only removed the direct config import from the REPL entrypoint, but the built REPL still failed because the shared LLM/tool chain imported `config` transitively:
+  - `TURSO_DATABASE_URL='file:/tmp/latent-space-bots-local.db' OPENROUTER_API_KEY='test-key' env -u BOT_TOKEN_SLOP ./bin/ls-chat`
+  - failed with:
+  - `Error: Missing required env var: BOT_TOKEN_SLOP`
+- That made it clear the fix had to be at `config`/startup boundaries, not just the REPL file.
+
+### What I learned
+- Shared runtime imports are broad enough that config-time env checks need to be reserved for truly shared requirements, not transport-specific ones.
+- The right split here is “profile exists” vs “profile is startable as a Discord bot.”
+- A built-entrypoint validation matters because `./bin/ls-chat` prefers `dist/`, not the TypeScript source.
+
+### What was tricky to build
+- The REPL and the Discord bot share the same `BotProfile` type, so the change needed to remain type-safe while changing when token validity is enforced.
+- The first fix looked correct in the source tree but still failed in the compiled runtime because of transitive imports.
+- The final validation had to use the real launcher path with `BOT_TOKEN_SLOP` explicitly unset, not just omitted in prose.
+
+### What warrants a second pair of eyes
+- [`src/config.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/config.ts): review whether any other transport-specific env checks should move out of module import time in the future.
+- [`src/index.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/index.ts): confirm the “active profiles” filtering matches the intended production startup behavior if more bots are added later.
+
+### What should be done in the future
+- If more local-only transports are added, factor a dedicated “runtime profile” helper so those adapters do not repeat the same Slop profile construction.
+
+### Code review instructions
+- Start with [`src/config.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/config.ts), then read [`src/index.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/index.ts) and [`src/discord/bot.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/discord/bot.ts).
+- Review the REPL entrypoint in [`src/adapters/console/repl.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/adapters/console/repl.ts).
+- Validate with:
+  - `npm run build`
+  - `npm test`
+  - `TURSO_DATABASE_URL='file:/tmp/latent-space-bots-local.db' OPENROUTER_API_KEY='test-key' env -u BOT_TOKEN_SLOP ./bin/ls-chat`
+
+### Technical details
+- Successful validation commands:
+  - `npm run build`
+  - `npm test`
+  - `TURSO_DATABASE_URL='file:/tmp/latent-space-bots-local.db' OPENROUTER_API_KEY='test-key' env -u BOT_TOKEN_SLOP ./bin/ls-chat`
+- In-session validation:
+  - `/join`
+  - `/quit`
+- Failed first-pass validation that drove the broader fix:
+  - `TURSO_DATABASE_URL='file:/tmp/latent-space-bots-local.db' OPENROUTER_API_KEY='test-key' env -u BOT_TOKEN_SLOP ./bin/ls-chat`
+  - `Error: Missing required env var: BOT_TOKEN_SLOP`
