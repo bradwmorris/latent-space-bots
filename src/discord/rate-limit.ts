@@ -10,9 +10,23 @@ export function withinRateLimit(
   profileName: BotProfile["name"],
   options?: { ownedThread?: boolean }
 ): boolean {
+  return withinRateLimitByKey(
+    profileName,
+    message.author.id,
+    message.channelId,
+    options
+  );
+}
+
+export function withinRateLimitByKey(
+  profileName: BotProfile["name"],
+  userId: string,
+  conversationId: string,
+  options?: { ownedThread?: boolean }
+): boolean {
   const now = Date.now();
-  const userKey = `${profileName}:${message.author.id}`;
-  const channelKey = `${profileName}:${message.channelId}`;
+  const userKey = `${profileName}:${userId}`;
+  const channelKey = `${profileName}:${conversationId}`;
   const userLast = rateLimitByUser.get(userKey) || 0;
   const channelLast = rateLimitByChannel.get(channelKey) || 0;
   const ownedThread = Boolean(options?.ownedThread);

@@ -39,7 +39,6 @@ export type SchedulingSession = {
   availableDates: string[];
   step: "pick_date" | "pick_title";
   chosenDate?: string;
-  clientRef?: Client;
 };
 
 export type MemberMetadata = {
