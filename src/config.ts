@@ -11,6 +11,10 @@ export function requiredEnv(name: string): string {
   return value;
 }
 
+function isLocalLibsqlUrl(url: string): boolean {
+  return url.startsWith("file:") || url === ":memory:" || url === "file::memory:";
+}
+
 function boolFromEnv(value: string | undefined, fallback: boolean): boolean {
   if (value == null || value.trim() === "") return fallback;
   const normalized = value.trim().toLowerCase();
@@ -18,7 +22,9 @@ function boolFromEnv(value: string | undefined, fallback: boolean): boolean {
 }
 
 export const TURSO_DATABASE_URL = requiredEnv("TURSO_DATABASE_URL");
-export const TURSO_AUTH_TOKEN = requiredEnv("TURSO_AUTH_TOKEN");
+export const TURSO_AUTH_TOKEN = isLocalLibsqlUrl(TURSO_DATABASE_URL)
+  ? process.env.TURSO_AUTH_TOKEN || ""
+  : requiredEnv("TURSO_AUTH_TOKEN");
 export const OPENROUTER_API_KEY = requiredEnv("OPENROUTER_API_KEY");
 
 export const SLOP_MODEL = process.env.SLOP_MODEL || "anthropic/claude-sonnet-4-6";
@@ -48,10 +54,14 @@ export const BOT_INSTANCE_ID =
 
 export const clientsByProfile = new Map<BotProfile["name"], Client>();
 
-export const db = createLibsqlClient({
-  url: TURSO_DATABASE_URL,
-  authToken: TURSO_AUTH_TOKEN
-});
+export const db = isLocalLibsqlUrl(TURSO_DATABASE_URL)
+  ? createLibsqlClient({
+      url: TURSO_DATABASE_URL,
+    })
+  : createLibsqlClient({
+      url: TURSO_DATABASE_URL,
+      authToken: TURSO_AUTH_TOKEN,
+    });
 
 export const profiles: BotProfile[] = [
   {

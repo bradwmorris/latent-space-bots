@@ -38,6 +38,14 @@ After a user runs `/join`:
 
 The repo includes a Slop-only local console REPL backed by the same transport-neutral runtime used by the Discord bot. It is useful for testing routing, thread creation, and command/session flows without connecting to Discord.
 
+Before using a brand-new local SQLite file, bootstrap the schema once:
+
+```bash
+npm run db:init:local -- .local/latent-space-bots.db
+```
+
+That creates the hub-compatible core tables this repo expects (`nodes`, `edges`, `node_dimensions`, `chunks`, `dimensions`, `chats`, `logs`) plus the member/event indexes used by the bot. It is a local dev schema, not a production data clone.
+
 Start it in either of these ways:
 
 ```bash
@@ -69,6 +77,17 @@ Usage notes:
 - The REPL auto-creates and auto-switches into owned threads when the runtime opens one.
 - Literal slash commands are handled locally and routed through the same core command services as Discord.
 - If you use `./bin/ls-chat`, it prefers the compiled `dist/` entrypoint and falls back to the TypeScript source via `tsx`.
+
+Example local REPL startup:
+
+```bash
+TURSO_DATABASE_URL='file:/absolute/path/to/.local/latent-space-bots.db' \
+OPENROUTER_API_KEY='your-openrouter-key' \
+BOT_TOKEN_SLOP='local-repl-token' \
+npm run repl
+```
+
+`TURSO_AUTH_TOKEN` is optional when `TURSO_DATABASE_URL` uses `file:`.
 
 ## Graph runtime
 
