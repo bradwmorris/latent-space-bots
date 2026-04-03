@@ -1,5 +1,6 @@
 import { createClient as createLibsqlClient } from "@libsql/client";
 import os from "node:os";
+import path from "node:path";
 import type { Client } from "discord.js";
 import type { BotProfile } from "./types";
 
@@ -12,7 +13,15 @@ export function requiredEnv(name: string): string {
 }
 
 function isLocalLibsqlUrl(url: string): boolean {
-  return url.startsWith("file:") || url === ":memory:" || url === "file::memory:";
+  if (url.startsWith("file:") || url === ":memory:" || url === "file::memory:") return true;
+  return !/^[a-z][a-z0-9+.-]*:\/\//i.test(url);
+}
+
+function normalizeLibsqlUrl(url: string): string {
+  if (!isLocalLibsqlUrl(url) || url.startsWith("file:") || url === ":memory:" || url === "file::memory:") {
+    return url;
+  }
+  return `file:${path.resolve(url)}`;
 }
 
 function boolFromEnv(value: string | undefined, fallback: boolean): boolean {
@@ -21,8 +30,9 @@ function boolFromEnv(value: string | undefined, fallback: boolean): boolean {
   return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
 }
 
-export const TURSO_DATABASE_URL = requiredEnv("TURSO_DATABASE_URL");
-export const TURSO_AUTH_TOKEN = isLocalLibsqlUrl(TURSO_DATABASE_URL)
+const RAW_TURSO_DATABASE_URL = requiredEnv("TURSO_DATABASE_URL");
+export const TURSO_DATABASE_URL = normalizeLibsqlUrl(RAW_TURSO_DATABASE_URL);
+export const TURSO_AUTH_TOKEN = isLocalLibsqlUrl(RAW_TURSO_DATABASE_URL)
   ? process.env.TURSO_AUTH_TOKEN || ""
   : requiredEnv("TURSO_AUTH_TOKEN");
 export const OPENROUTER_API_KEY = requiredEnv("OPENROUTER_API_KEY");

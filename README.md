@@ -81,12 +81,12 @@ Usage notes:
 Example local REPL startup:
 
 ```bash
-TURSO_DATABASE_URL='file:/absolute/path/to/.local/latent-space-bots.db' \
+TURSO_DATABASE_URL='/absolute/path/to/.local/latent-space-bots.db' \
 OPENROUTER_API_KEY='your-openrouter-key' \
 npm run repl
 ```
 
-`BOT_TOKEN_SLOP` is not required for the console REPL. It is still required for the actual Discord bot process. `TURSO_AUTH_TOKEN` is optional when `TURSO_DATABASE_URL` uses `file:`.
+`BOT_TOKEN_SLOP` is not required for the console REPL. It is still required for the actual Discord bot process. `TURSO_AUTH_TOKEN` is optional for local SQLite values, whether you pass `TURSO_DATABASE_URL` as a bare filesystem path or a `file:` URL.
 
 ## Graph runtime
 
