@@ -11,22 +11,22 @@
 
 ### Phase 1: Extract Core Services
 
-- [ ] Extract /join into a transport-neutral command service using plain actor and reply inputs
-- [ ] Extract mention-driven response generation into a transport-neutral core chat service
-- [ ] Extract transport-neutral scheduling and edit-event session stores keyed by conversation ID
+- [x] Extract /join into a transport-neutral command service using plain actor and reply inputs
+- [x] Extract mention-driven response generation into a transport-neutral core chat service
+- [x] Extract transport-neutral scheduling and edit-event session stores keyed by conversation ID
 
 ### Phase 2: Introduce Runtime Types
 
-- [ ] Define normalized conversation event and effect types for message and command flows
-- [ ] Implement a core runtime dispatcher that routes normalized events to chat and command services
+- [x] Define normalized conversation event and effect types for message and command flows
+- [x] Implement a core runtime dispatcher that routes normalized events to chat and command services
 
 ### Phase 3: Migrate Discord Adapter
 
-- [ ] Refactor the Discord message adapter to translate events into the core runtime and apply effects back to Discord
-- [ ] Refactor Discord slash-command handling to use the core runtime for /join, /paper-club, and /edit-event
+- [x] Refactor the Discord message adapter to translate events into the core runtime and apply effects back to Discord
+- [x] Refactor Discord slash-command handling to use the core runtime for /join, /paper-club, and /edit-event
 
 ### Phase 4: Console REPL
 
-- [ ] Build a Slop-only console adapter with in-memory users, channels, threads, and effect application
-- [ ] Document local REPL usage and validation steps in repo docs after the first working version lands
-- [ ] Add a readline REPL entrypoint with literal local commands and operator controls like /as, /threads, and /switch
+- [x] Build a Slop-only console adapter with in-memory users, channels, threads, and effect application
+- [x] Document local REPL usage and validation steps in repo docs after the first working version lands
+- [x] Add a readline REPL entrypoint with literal local commands and operator controls like /as, /threads, and /switch

@@ -34,3 +34,12 @@ Step 1: added characterization tests for routing, thread creation, scheduling re
 - /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/__tests__/routing.test.ts — Locked down routing behavior before the runtime refactor
 - /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/__tests__/threads.test.ts — Locked down thread creation behavior before the runtime refactor
 
+
+## 2026-04-03
+
+Step 3: live-tested the REPL in tmux, fixed missing skills bootstrap, and prevented runtime DB errors from crashing the session.
+
+### Related Files
+
+- /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/adapters/console/repl.ts — Loaded skills context at REPL startup and wrapped dispatch paths in top-level error handling
+
