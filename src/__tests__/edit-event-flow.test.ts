@@ -30,7 +30,7 @@ describe("edit-event flow", () => {
   });
 
   it("selects an event and moves from pick_event to menu", async () => {
-    const session = {
+    const session: any = {
       memberDiscordId: "user-1",
       events: [
         {
@@ -55,7 +55,7 @@ describe("edit-event flow", () => {
   });
 
   it("moves a paper-club session from menu to edit_notes", async () => {
-    const session = {
+    const session: any = {
       memberDiscordId: "user-1",
       selectedEventId: 1,
       events: [
@@ -80,7 +80,7 @@ describe("edit-event flow", () => {
   });
 
   it("rejects invalid builder-club menu choices", async () => {
-    const session = {
+    const session: any = {
       memberDiscordId: "user-1",
       selectedEventId: 2,
       events: [

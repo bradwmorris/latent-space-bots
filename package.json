@@ -11,6 +11,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
+    "repl": "tsx src/adapters/console/repl.ts",
     "test": "vitest run",
     "backfill:member-avatars": "tsx scripts/backfill-member-avatars.ts"
   },
