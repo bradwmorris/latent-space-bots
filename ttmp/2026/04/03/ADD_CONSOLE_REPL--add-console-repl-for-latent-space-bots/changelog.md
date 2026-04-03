@@ -66,3 +66,23 @@ Step 5: remove the Discord token requirement from console REPL startup and valid
 - /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/config.ts — Profile config no longer throws at import time when BOT_TOKEN_SLOP is absent
 - /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/discord/bot.ts — Preserves the real token requirement at Discord login time
 - /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/index.ts — Filters tokenless profiles out of bot startup
+
+
+## 2026-04-03
+
+Step 6: accept bare local SQLite paths in `TURSO_DATABASE_URL` and validate the exact `/tmp/...` launcher form (commit df55a2ccedfcf00d38f6dabffe1aa486f0b910a6)
+
+### Related Files
+
+- /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/README.md — Documents that local DB startup accepts both bare paths and `file:` URLs
+- /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/config.ts — Normalizes plain filesystem paths into `file:` URLs and keeps auth optional for local DBs
+
+
+## 2026-04-03
+
+Step 7: ran a full REPL validation pass across local transport/session flows and OpenRouter-backed chat using the local DB
+
+### Related Files
+
+- /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/adapters/console/repl.ts — End-to-end REPL path validated against local command flows and mention-driven chat
+- /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/config.ts — Validated bare-path local DB startup with BOT_TOKEN_SLOP unset

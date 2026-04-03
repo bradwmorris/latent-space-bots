@@ -29,6 +29,7 @@ RelatedFiles:
       Note: |-
         Local file-based libsql URLs no longer require TURSO_AUTH_TOKEN
         Allows file-based libsql URLs to omit TURSO_AUTH_TOKEN
+        Accepts bare local SQLite paths by normalizing them to file: URLs
     - Path: src/discord/bot.ts
       Note: |-
         Discord startup still requires a real token even though the REPL does not
@@ -39,7 +40,7 @@ RelatedFiles:
         Main startup now filters profiles without login tokens
 ExternalSources: []
 Summary: Implementation diary for the transport/runtime refactor and local console REPL work.
-LastUpdated: 2026-04-03T14:24:00-07:00
+LastUpdated: 2026-04-03T15:25:00-07:00
 WhatFor: Capture the implementation journey, validation, risks, and review guidance for the console REPL and transport refactor.
 WhenToUse: Use when continuing implementation or reviewing completed phases of the ticket.
 ---
@@ -486,3 +487,182 @@ I moved the token requirement to the actual Discord startup boundary instead of 
 - Failed first-pass validation that drove the broader fix:
   - `TURSO_DATABASE_URL='file:/tmp/latent-space-bots-local.db' OPENROUTER_API_KEY='test-key' env -u BOT_TOKEN_SLOP ./bin/ls-chat`
   - `Error: Missing required env var: BOT_TOKEN_SLOP`
+
+## Step 6: Accept Bare Local SQLite Paths In TURSO_DATABASE_URL
+
+The next local-setup failure came from the exact shell form you used: `TURSO_DATABASE_URL=/tmp/latent-space-bots-local.db ./bin/ls-chat`. The earlier local-db fix only treated `file:` URLs as local, so a bare filesystem path was incorrectly treated as a remote libsql URL and still demanded `TURSO_AUTH_TOKEN`.
+
+I kept the single canonical env var and fixed the parsing instead of adding a second local-only variable. The config layer now treats non-URL filesystem values as local SQLite paths, normalizes them to `file:` URLs for `@libsql/client`, and continues to require `TURSO_AUTH_TOKEN` only for actual remote URL forms like `libsql://...`.
+
+### Prompt Context
+
+**User prompt (verbatim):** "Maybe we make it a distinct env var for local?"
+
+**Assistant interpretation:** Evaluate whether a separate local-db environment variable is a better fix than improving `TURSO_DATABASE_URL`, then implement the cleaner path and validate the exact bare-path command the user tried.
+
+**Inferred user intent:** The user wants the local startup path to be simple and unsurprising; the config should match how people naturally type a local SQLite path in the shell.
+
+**Commit (code):** df55a2ccedfcf00d38f6dabffe1aa486f0b910a6 — "fix(config): accept bare local sqlite paths"
+
+### What I did
+- Updated [`src/config.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/config.ts) to:
+  - recognize plain filesystem paths as local libsql values
+  - normalize them to `file:/abs/path/...` before creating the client
+  - keep `TURSO_AUTH_TOKEN` optional for local values and required for real URL-based remote connections
+- Updated [`README.md`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/README.md) to prefer the simpler bare-path example while noting that `file:` URLs also work.
+- Validated the exact launcher shape:
+  - `npm run build`
+  - `npm test`
+  - `TURSO_DATABASE_URL=/tmp/latent-space-bots-local.db OPENROUTER_API_KEY='test-key' env -u BOT_TOKEN_SLOP ./bin/ls-chat`
+  - in session: `/quit`
+
+### Why
+- A second env var like `LOCAL_DB_PATH` would create two configuration paths for the same concept and force extra precedence rules.
+- Users will naturally type a plain path for a local SQLite file; the app should accept that form directly.
+- Normalizing to a `file:` URL internally keeps the runtime behavior consistent while preserving a simple CLI experience.
+
+### What worked
+- The config change was small and isolated to one place.
+- The built launcher now accepts the exact bare-path form you used.
+- Tests and build remained green after the normalization logic changed.
+
+### What didn't work
+- The original local-db logic was too literal and only recognized `file:` inputs, which caused this failure:
+  - `TURSO_DATABASE_URL=/tmp/latent-space-bots-local.db ./bin/ls-chat`
+  - `Error: Missing required env var: TURSO_AUTH_TOKEN`
+
+### What I learned
+- The right distinction is not “local env var vs remote env var”; it is “URL-shaped remote connection string vs local filesystem path.”
+- Bare-path normalization belongs in config, not scattered across scripts or docs.
+
+### What was tricky to build
+- The normalization needed to preserve the remote auth requirement while broadening the accepted local syntax.
+- Validation had to use the built launcher because `./bin/ls-chat` reads `dist/` first and that was the failing path in your report.
+
+### What warrants a second pair of eyes
+- [`src/config.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/config.ts): review whether the local-path detection covers every connection-string form you want to support long-term.
+
+### What should be done in the future
+- If Windows or other platform-specific path forms matter later, extend the normalization rules with explicit tests rather than adding a second environment variable.
+
+### Code review instructions
+- Read [`src/config.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/config.ts).
+- Check the operator example in [`README.md`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/README.md).
+- Validate with:
+  - `TURSO_DATABASE_URL=/tmp/latent-space-bots-local.db OPENROUTER_API_KEY='test-key' env -u BOT_TOKEN_SLOP ./bin/ls-chat`
+
+### Technical details
+- Successful validation commands:
+  - `npm run build`
+  - `npm test`
+  - `TURSO_DATABASE_URL=/tmp/latent-space-bots-local.db OPENROUTER_API_KEY='test-key' env -u BOT_TOKEN_SLOP ./bin/ls-chat`
+- Failure that motivated the change:
+  - `TURSO_DATABASE_URL=/tmp/latent-space-bots-local.db ./bin/ls-chat`
+  - `Error: Missing required env var: TURSO_AUTH_TOKEN`
+
+## Step 7: Run A Full REPL Validation Pass Against The Local DB And OpenRouter
+
+With the local-db bootstrap, tokenless REPL startup, and bare-path normalization all in place, I ran a full interactive validation pass through the actual REPL launcher. This pass covered both local transport/session behavior and the real OpenRouter-backed chat path using the local SQLite database as the backing store.
+
+The first in-sandbox mention test failed with `fetch failed`, which matched the sandbox’s blocked outbound network behavior rather than a repo bug. I reran the same REPL session outside the sandbox, then verified the paths that matter: startup, `/users`, `/threads`, `/join`, Paper Club scheduling, Builders Club scheduling, thread switching, thread follow-up without re-mentioning, user switching with `/as`, and `/edit-event` for a user with no scheduled events.
+
+### Prompt Context
+
+**User prompt (verbatim):** "OK great. It seems to be working in limited testing. There is an openrouter api key in your env, can you test through the repl and check the different pieces you implemented?"
+
+**Assistant interpretation:** Use the real REPL launcher with the configured OpenRouter key and local DB, exercise the major runtime and adapter behaviors, and confirm whether the implementation holds up end-to-end.
+
+**Inferred user intent:** The user wants confidence in the actual operator workflow, not just unit tests and isolated command-path validation.
+
+### What I did
+- Started the REPL locally against `/tmp/latent-space-bots-local.db` with `BOT_TOKEN_SLOP` unset.
+- Verified basic local adapter behavior:
+  - `/users`
+  - `/threads`
+  - `/join`
+- Verified scheduling flows:
+  - `/paper-club`
+  - replied `1 Scaling laws for retrieval https://example.com/paper`
+  - `/builders-club`
+  - replied `1 GPU infra lessons from serving`
+- Verified thread navigation:
+  - `/threads`
+  - `/switch general`
+- Verified edit-event behavior:
+  - `/edit-event` as `@alice` showed both scheduled events and edit options
+  - `6` exited the menu cleanly
+  - `/as @bob`
+  - `/edit-event` as `@bob` returned `You don't have any upcoming scheduled events.`
+- Verified the real OpenRouter path outside the sandbox:
+  - `@slop upcoming paper clubs`
+  - in-thread follow-up: `what about builders club?`
+  - `/switch general`
+  - `/as @bob`
+  - `@slop upcoming builders clubs`
+- Confirmed the chat path created owned threads and answered using `slop_get_upcoming_events`.
+
+### Why
+- This is the first test pass that covered the integrated runtime, local transport, local DB, and real LLM/tool loop together.
+- The REPL exists to support this exact development workflow, so the operator path matters more than synthetic unit coverage alone.
+
+### What worked
+- Startup with a bare local DB path and no bot token worked.
+- `/join`, `/paper-club`, `/builders-club`, `/switch`, `/as`, and `/edit-event` all behaved correctly in-session.
+- Mention-driven chat created owned threads and reused the thread correctly for follow-up without re-mentioning.
+- The OpenRouter-backed answers used the expected tool:
+  - `slop_get_upcoming_events`
+- The negative path for `/edit-event` as a user with no events was correct and user-readable.
+
+### What didn't work
+- The first mention-driven chat run inside the sandbox failed with:
+  - `Slop hit an error while generating a response: fetch failed`
+- That was environmental rather than a code bug; rerunning the same REPL command outside the sandbox resolved it.
+
+### What I learned
+- The REPL is now strong enough to act as the primary local integration loop for this bot.
+- The best grounding query for local verification is one that relies on deterministic local state, like upcoming scheduled events, rather than open-ended content retrieval against an almost-empty DB.
+- Thread ownership and transport/session boundaries are behaving the way the refactor intended.
+
+### What was tricky to build
+- The only tricky part of the validation pass was separating sandboxed network failure from an application failure.
+- The LLM path needed an escalated run to prove the implementation instead of just proving the sandbox boundary.
+
+### What warrants a second pair of eyes
+- The link formatting in the Builders Club answer included a generic `https://discord.com/channels/` link shape, which is not a runtime failure but may be worth reviewing if link generation quality matters for local or future Discord-backed answers.
+
+### What should be done in the future
+- If we want richer local chat testing, seed the local DB with a small set of real nodes/chunks so retrieval queries go beyond scheduled events and member state.
+
+### Code review instructions
+- Start with [`src/adapters/console/repl.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/adapters/console/repl.ts) and [`src/config.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/config.ts).
+- Validate with the real launcher:
+  - `TURSO_DATABASE_URL=/tmp/latent-space-bots-local.db env -u BOT_TOKEN_SLOP ./bin/ls-chat`
+- In session, exercise:
+  - `/join`
+  - `/paper-club`
+  - `/builders-club`
+  - `/edit-event`
+  - `/as @bob`
+  - `@slop upcoming paper clubs`
+  - `what about builders club?`
+
+### Technical details
+- In-sandbox validation command:
+  - `TURSO_DATABASE_URL=/tmp/latent-space-bots-local.db env -u BOT_TOKEN_SLOP ./bin/ls-chat`
+- Escalated validation command for OpenRouter-backed chat:
+  - `TURSO_DATABASE_URL=/tmp/latent-space-bots-local.db env -u BOT_TOKEN_SLOP ./bin/ls-chat`
+- Commands used inside the REPL:
+  - `/users`
+  - `/threads`
+  - `/join`
+  - `/paper-club`
+  - `1 Scaling laws for retrieval https://example.com/paper`
+  - `/switch general`
+  - `/builders-club`
+  - `1 GPU infra lessons from serving`
+  - `/edit-event`
+  - `6`
+  - `@slop upcoming paper clubs`
+  - `what about builders club?`
+  - `/as @bob`
+  - `@slop upcoming builders clubs`
