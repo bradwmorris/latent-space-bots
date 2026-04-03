@@ -1,6 +1,7 @@
 import "dotenv/config";
 import readline from "node:readline";
 import { getProfileByName } from "../../config";
+import { loadSkillsContextFromLocalStrict } from "../../skills";
 import {
   dispatchRuntimeCommandEvent,
   dispatchRuntimeMessageEvent,
@@ -10,6 +11,7 @@ import { ConsoleRuntimeClient } from "./client";
 
 const profile = getProfileByName("Slop");
 const client = new ConsoleRuntimeClient();
+const skillsContext = loadSkillsContextFromLocalStrict();
 
 function printSystem(message: string): void {
   process.stdout.write(`\x1b[90m${message}\x1b[0m\n`);
@@ -118,11 +120,16 @@ async function handleLocalCommand(input: string): Promise<boolean> {
     input === "/edit-event"
   ) {
     const event = client.createCommandEvent(input.slice(1) as RuntimeCommandName);
-    await dispatchRuntimeCommandEvent(
-      profile,
-      event,
-      client.createCommandTransport(event.conversation)
-    );
+    try {
+      await dispatchRuntimeCommandEvent(
+        profile,
+        event,
+        client.createCommandTransport(event.conversation)
+      );
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      printSystem(`Error: ${msg}`);
+    }
     return true;
   }
 
@@ -130,6 +137,7 @@ async function handleLocalCommand(input: string): Promise<boolean> {
 }
 
 printSystem("Profile: Slop");
+printSystem(`Skills loaded: ${skillsContext.length} chars`);
 printSystem(`Channel: #${client.getCurrentConversation().name}`);
 printSystem(`Active user: @${client.getCurrentUser().username}`);
 printSystem('Mention the bot with "@slop" to begin');
@@ -154,12 +162,17 @@ rl.on("line", async (line) => {
   const event = client.createMessageEvent(input);
   await client.sendUserEcho(event);
   printUser(event.actor.username, input);
-  await dispatchRuntimeMessageEvent(
-    profile,
-    event,
-    client.createChatTransport(),
-    client.createReplyPort(event)
-  );
+  try {
+    await dispatchRuntimeMessageEvent(
+      profile,
+      event,
+      client.createChatTransport(),
+      client.createReplyPort(event)
+    );
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    printSystem(`Error: ${msg}`);
+  }
   updatePrompt();
 });
 
