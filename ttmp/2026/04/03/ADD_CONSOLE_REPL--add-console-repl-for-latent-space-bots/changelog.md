@@ -43,3 +43,14 @@ Step 3: live-tested the REPL in tmux, fixed missing skills bootstrap, and preven
 
 - /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/adapters/console/repl.ts — Loaded skills context at REPL startup and wrapped dispatch paths in top-level error handling
 
+
+## 2026-04-03
+
+Step 4: add local SQLite bootstrap path for the REPL and validate /join against a fresh file DB (commit d351004d54886d9ef02a8dadabb2b107aa67248e)
+
+### Related Files
+
+- /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/README.md — Local DB workflow docs
+- /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/scripts/init-local-db.cjs — Local SQLite schema bootstrap
+- /Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/config.ts — Local file DB auth handling
+

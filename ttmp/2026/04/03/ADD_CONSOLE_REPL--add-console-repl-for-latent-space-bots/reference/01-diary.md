@@ -7,6 +7,14 @@ DocType: reference
 Intent: long-term
 Owners: []
 RelatedFiles:
+    - Path: README.md
+      Note: |-
+        Documents how to initialize and run against a local DB
+        Documents local DB initialization and REPL startup
+    - Path: scripts/init-local-db.cjs
+      Note: |-
+        Local SQLite bootstrap for the REPL and bot runtime
+        Local SQLite bootstrap script for REPL and bot runtime
     - Path: src/__tests__/edit-event-flow.test.ts
       Note: Characterization coverage for edit-event session transitions
     - Path: src/__tests__/routing.test.ts
@@ -17,12 +25,17 @@ RelatedFiles:
       Note: Characterization coverage for thread creation behavior
     - Path: src/adapters/console/repl.ts
       Note: REPL startup and top-level error handling fixed after live tmux testing
+    - Path: src/config.ts
+      Note: |-
+        Local file-based libsql URLs no longer require TURSO_AUTH_TOKEN
+        Allows file-based libsql URLs to omit TURSO_AUTH_TOKEN
 ExternalSources: []
 Summary: Implementation diary for the transport/runtime refactor and local console REPL work.
-LastUpdated: 2026-04-03T13:40:45.116124-07:00
+LastUpdated: 2026-04-03T14:19:00-07:00
 WhatFor: Capture the implementation journey, validation, risks, and review guidance for the console REPL and transport refactor.
 WhenToUse: Use when continuing implementation or reviewing completed phases of the ticket.
 ---
+
 
 
 
@@ -288,3 +301,97 @@ I fixed both issues in the REPL entrypoint. The startup path now loads skills co
   - `tmux capture-pane -pt lsrepl`
 - Direct PTY validation used to isolate the crash path:
   - `TURSO_DATABASE_URL='file:/tmp/latent-space-bots-repl.db' TURSO_AUTH_TOKEN='test-token' OPENROUTER_API_KEY='test-key' BOT_TOKEN_SLOP='test-bot-token' ./bin/ls-chat`
+
+## Step 4: Bootstrap A Real Local SQLite Schema For The REPL
+
+The REPL-hardening work proved that the remaining local-dev blocker was not the transport layer anymore; it was the missing database schema. `latent-space-bots` assumes the shared Latent Space Hub tables already exist, but the repo had no local bootstrap path, so pointing `TURSO_DATABASE_URL` at a fresh `file:` database still failed on the first DB-backed operation.
+
+I added a repo-local schema bootstrap script and relaxed config so local `file:` databases do not require a Turso auth token. The important outcome is that a fresh local SQLite file can now be initialized from this repo and used immediately by the REPL for member/event flows like `/join`, instead of dying on `SQLITE_ERROR: no such table: nodes`.
+
+### Prompt Context
+
+**User prompt (verbatim):** "Figure out how to create a local db"
+
+**Assistant interpretation:** Determine what schema the repo expects, add a practical way to initialize a local database for development, and validate it against the console REPL.
+
+**Inferred user intent:** The user wants a real local development workflow for the REPL instead of a synthetic setup that only proves routing while every DB-backed feature fails.
+
+**Commit (code):** d351004d54886d9ef02a8dadabb2b107aa67248e — "feat(local-db): add local sqlite bootstrap path"
+
+### What I did
+- Traced the schema assumptions in [`src/db.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/db.ts) and confirmed `latent-space-bots` expects the same core tables as the Hub: `nodes`, `edges`, `node_dimensions`, `dimensions`, `chunks`, `chats`, and `logs`.
+- Verified that [`latent-space-bots`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots) had no schema or migration files, then located the source schema in [`latent-space-hub/setup-schema.mjs`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-hub/setup-schema.mjs).
+- Added [`scripts/init-local-db.cjs`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/scripts/init-local-db.cjs), a plain-Node bootstrap script that creates the core tables and indexes needed by the bots and seeds the event/member dimensions used by the REPL flows.
+- Updated [`src/config.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/config.ts) so `TURSO_AUTH_TOKEN` is optional for `file:` URLs while remaining required for remote Turso connections.
+- Added an npm entrypoint in [`package.json`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/package.json) and documented the workflow in [`README.md`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/README.md) and [.env.example](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/.env.example).
+- Validated the full path with:
+  - `npm run db:init:local -- /tmp/latent-space-bots-local.db`
+  - `npm run build`
+  - `npm test`
+  - `TURSO_DATABASE_URL='file:/tmp/latent-space-bots-local.db' OPENROUTER_API_KEY='test-key' BOT_TOKEN_SLOP='local-repl-token' ./bin/ls-chat`
+  - in session: `/join`
+- Verified the DB write directly:
+  - `sqlite3 /tmp/latent-space-bots-local.db "select id,title,node_type,json_extract(metadata,'$.discord_id') from nodes;"`
+  - output: `1|alice|member|u-2`
+
+### Why
+- The REPL is only useful as a local development loop if it can run against a real, empty-on-day-one SQLite file.
+- The schema belongs conceptually to the Hub, but `latent-space-bots` still needed its own bootstrap path because REPL work happens in this repo and should not require manually spelunking a sibling project first.
+- A plain Node bootstrap script is more robust than a `tsx`-only script for local setup tasks.
+
+### What worked
+- The Hub schema was stable enough to reuse as the basis for a local bootstrap instead of inventing a bot-specific schema.
+- Local `file:` URLs work fine with `@libsql/client` without an auth token once config stops enforcing one.
+- The initialized DB was good enough for the REPL to create a member row through `/join` with no missing-table errors.
+- `npm run build` and `npm test` both stayed green after the config and docs changes.
+
+### What didn't work
+- My first version of the bootstrap script used `tsx`:
+  - `npm run db:init:local -- /tmp/latent-space-bots-local.db`
+  - failed under sandboxed execution with:
+  - `Error: listen EPERM: operation not permitted /var/folders/.../tsx-501/10351.pipe`
+- `latent-space-bots` does not compile `scripts/` into `dist/`, so trying to run a built script path was a dead end:
+  - `node dist/scripts/init-local-db.js /tmp/latent-space-bots-local.db`
+  - failed with:
+  - `Error: Cannot find module '/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/dist/scripts/init-local-db.js'`
+- Those failures led to switching the bootstrap script to plain CommonJS and invoking it directly with `node`.
+
+### What I learned
+- The missing-schema problem came from repo boundaries, not from the REPL implementation itself.
+- The minimum useful local schema is the Hub core plus the member/event uniqueness indexes; vector indexes are optional for local REPL work because the code already tolerates vector search failure.
+- Setup scripts should avoid `tsx` when they do not need TypeScript-only features.
+
+### What was tricky to build
+- The bootstrap needed to be close enough to the Hub schema to avoid later surprises, but still practical for a plain local SQLite file that may not support every Turso-native feature.
+- The repo’s runtime config is imported eagerly, so making local auth optional had to preserve the remote-production behavior exactly.
+- I had to validate not just table creation but the operator path that originally failed, which meant bootstrapping a DB and then exercising the REPL against it.
+
+### What warrants a second pair of eyes
+- [`scripts/init-local-db.cjs`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/scripts/init-local-db.cjs): review whether the seeded dimensions and optional FTS setup are the right long-term local-dev defaults.
+- [`src/config.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/config.ts): confirm the `file:` URL detection covers every local libsql mode you care about and does not loosen remote auth requirements accidentally.
+
+### What should be done in the future
+- If local semantic search matters, add an explicit script or doc path for loading real hub content into the local DB instead of only bootstrapping the empty schema.
+- Consider a startup warning in the REPL when the DB is empty, so users know the schema exists but retrieval results will still be blank until content is loaded.
+
+### Code review instructions
+- Start with [`scripts/init-local-db.cjs`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/scripts/init-local-db.cjs), then read [`src/config.ts`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/src/config.ts).
+- Review the operator docs in [`README.md`](/Users/kball/workspaces/2026-04-03/console-chat/latent-space-bots/README.md).
+- Validate with:
+  - `npm run db:init:local -- /tmp/latent-space-bots-local.db`
+  - `npm run build`
+  - `npm test`
+  - `TURSO_DATABASE_URL='file:/tmp/latent-space-bots-local.db' OPENROUTER_API_KEY='test-key' BOT_TOKEN_SLOP='local-repl-token' ./bin/ls-chat`
+  - in session: `/join`
+
+### Technical details
+- Schema source consulted:
+  - `latent-space-hub/setup-schema.mjs`
+- Successful validation commands:
+  - `npm run db:init:local -- /tmp/latent-space-bots-local.db`
+  - `npm run build`
+  - `npm test`
+  - `sqlite3 /tmp/latent-space-bots-local.db "select id,title,node_type,json_extract(metadata,'$.discord_id') from nodes;"`
+- Failed prototype commands that shaped the final implementation:
+  - `npm run db:init:local -- /tmp/latent-space-bots-local.db` when it still used `tsx`
+  - `node dist/scripts/init-local-db.js /tmp/latent-space-bots-local.db`
