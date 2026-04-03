@@ -61,6 +61,10 @@ export async function handleInteraction(client: Client, profile: BotProfile, int
 }
 
 export async function startBot(profile: BotProfile): Promise<void> {
+  if (!profile.token.trim()) {
+    throw new Error(`${profile.name} cannot start without BOT_TOKEN_SLOP.`);
+  }
+
   const client = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
   });

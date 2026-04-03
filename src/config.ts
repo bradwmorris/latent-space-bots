@@ -66,7 +66,7 @@ export const db = isLocalLibsqlUrl(TURSO_DATABASE_URL)
 export const profiles: BotProfile[] = [
   {
     name: "Slop",
-    token: requiredEnv("BOT_TOKEN_SLOP"),
+    token: process.env.BOT_TOKEN_SLOP || "",
     model: SLOP_MODEL,
     appId: process.env.BOT_APP_ID_SLOP,
   }

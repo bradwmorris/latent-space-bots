@@ -1,15 +1,19 @@
 import "dotenv/config";
 import readline from "node:readline";
-import { getProfileByName } from "../../config";
 import { loadSkillsContextFromLocalStrict } from "../../skills";
 import {
   dispatchRuntimeCommandEvent,
   dispatchRuntimeMessageEvent,
 } from "../../core/runtime/dispatch";
 import type { RuntimeCommandName } from "../../core/runtime/types";
+import type { BotProfile } from "../../types";
 import { ConsoleRuntimeClient } from "./client";
 
-const profile = getProfileByName("Slop");
+const profile: BotProfile = {
+  name: "Slop",
+  token: "",
+  model: process.env.SLOP_MODEL || "anthropic/claude-sonnet-4-6",
+};
 const client = new ConsoleRuntimeClient();
 const skillsContext = loadSkillsContextFromLocalStrict();
 
