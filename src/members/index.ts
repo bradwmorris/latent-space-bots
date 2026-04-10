@@ -45,6 +45,20 @@ export async function lookupMember(discordId: string): Promise<MemberNode | null
 export async function createMemberNodeFromUser(
   user: Pick<User, "id" | "username" | "globalName" | "displayAvatarURL">
 ): Promise<{ id: number }> {
+  return createMemberNodeFromActor({
+    id: user.id,
+    username: user.username,
+    globalName: user.globalName || undefined,
+    avatarUrl: user.displayAvatarURL({ size: 256, extension: "png" }),
+  });
+}
+
+export async function createMemberNodeFromActor(user: {
+  id: string;
+  username: string;
+  globalName?: string;
+  avatarUrl?: string;
+}): Promise<{ id: number }> {
   const now = new Date().toISOString();
   const title = (user.globalName || user.username || "Discord Member").trim();
   return dbOps.createMemberNode(db, {
@@ -53,7 +67,7 @@ export async function createMemberNodeFromUser(
     metadata: {
       discord_id: user.id,
       discord_handle: user.username,
-      avatar_url: user.displayAvatarURL({ size: 256, extension: "png" }),
+      avatar_url: user.avatarUrl,
       joined_at: now,
       last_active: now,
       interaction_count: 0,
